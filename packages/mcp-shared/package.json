@@ -28,6 +28,14 @@
       "types": "./dist/staging/*.d.ts",
       "default": "./dist/staging/*.js"
     },
+    "./workspace/*": {
+      "types": "./dist/workspace/*.d.ts",
+      "default": "./dist/workspace/*.js"
+    },
+    "./monitor/*": {
+      "types": "./dist/monitor/*.d.ts",
+      "default": "./dist/monitor/*.js"
+    },
     "./entities/*": {
       "types": "./dist/entities/*.d.ts",
       "default": "./dist/entities/*.js"
@@ -55,6 +63,10 @@
     "./biothings/*": {
       "types": "./dist/biothings/*.d.ts",
       "default": "./dist/biothings/*.js"
+    },
+    "./coding/*": {
+      "types": "./dist/coding/*.d.ts",
+      "default": "./dist/coding/*.js"
     }
   },
   "scripts": {

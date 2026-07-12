@@ -3,14 +3,32 @@
  */
 
 import {
-	createCodeModeResponse,
-	createCodeModeError,
-	type CodeModeResponse,
-	type SuccessResponse,
-	type ErrorResponse,
-} from "../codemode/response";
+	type Completeness,
+	deriveMaterializationCompleteness,
+	mergeCompleteness,
+	paginationCompleteness,
+} from "../completeness";
+import { getRequestScope, type MaybeExtra } from "../registry/request-scope";
 import type { SchemaHints } from "./schema-inference";
-import { buildStagingMetadata, type StagingMetadata, type TableRelationship } from "./staging-metadata";
+import {
+	buildStagingMetadata,
+	type StagingMetadata,
+	type TableRelationship,
+} from "./staging-metadata";
+import {
+	DO_FETCH_ORIGIN,
+	stageIntoWorkspace,
+	type WorkspaceTarget,
+} from "./workspace-staging";
+
+// The standard query_data / get_schema tool handlers were extracted to keep this
+// file under the line cap. Re-exported here so the long-standing
+// `@bio-mcp/shared/staging/utils` import path (used across all servers) is stable.
+export {
+	createGetSchemaHandler,
+	createQueryDataHandler,
+	type DataHandlerOptions,
+} from "./query-handlers";
 
 const DEFAULT_STAGING_THRESHOLD = 30 * 1024; // 30KB — stage larger responses into SQLite for compact schema summaries
 
@@ -42,22 +60,13 @@ interface QueryResponse {
 	error?: string;
 	truncated?: boolean;
 	total_matching?: number;
-	diagnostics?: Array<{ severity: string; message: string; help?: string; kind: string }>;
+	diagnostics?: Array<{
+		severity: string;
+		message: string;
+		help?: string;
+		kind: string;
+	}>;
 	validated?: boolean;
-}
-
-interface ListDataset {
-	data_access_id: string;
-	tool_name: string | null;
-	tables: string[];
-	total_rows: number | null;
-	tool_prefix: string | null;
-	created_at: string;
-}
-
-interface ListResponse {
-	success?: boolean;
-	datasets?: ListDataset[];
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +79,10 @@ async function parseJsonResponse<T>(resp: Response, fallback: T): Promise<T> {
 }
 
 /** Decide whether a response should be staged based on byte size. */
-export function shouldStage(responseBytes: number, threshold?: number): boolean {
+export function shouldStage(
+	responseBytes: number,
+	threshold?: number,
+): boolean {
 	return responseBytes > (threshold ?? DEFAULT_STAGING_THRESHOLD);
 }
 
@@ -97,6 +109,23 @@ export interface StagingProvenance {
 	apiUrl?: string;
 }
 
+export interface StageOptions {
+	/**
+	 * Total records the upstream API reports as matching the query (e.g. from
+	 * `count` / `total_count` / `numFound`). When provided and it exceeds the
+	 * number of records actually staged, the resulting `_staging.completeness`
+	 * is flagged incomplete (pagination not exhausted). See {@link Completeness}.
+	 */
+	upstreamTotal?: number;
+	/**
+	 * ADR-006 Phase 0 — when present, route staging into a shared WorkspaceDO so
+	 * datasets from different servers land in ONE SQLite and can be JOINed. The
+	 * per-server `/process` + `/register` path is skipped entirely. Absent =
+	 * today's per-server staging, byte-for-byte unchanged. See {@link WorkspaceTarget}.
+	 */
+	workspace?: WorkspaceTarget;
+}
+
 export interface StageResult {
 	dataAccessId: string;
 	schema: unknown;
@@ -109,6 +138,47 @@ export interface StageResult {
 }
 
 /**
+ * Register a freshly-staged dataset in the per-server `__registry__` DO so
+ * `<prefix>_get_schema` (without a data_access_id) can enumerate it later.
+ * Best-effort: a registry write failure must NOT fail staging.
+ */
+async function registerStagedDataset(
+	doNamespace: DurableObjectNamespace,
+	scope: string,
+	dataAccessId: string,
+	tables: string[],
+	totalRows: number | undefined,
+	toolPrefix: string,
+	toolName: string | undefined,
+): Promise<void> {
+	try {
+		// Scope the registry DO to the request (defense-in-depth alongside the
+		// row-level session_id filter) so one session cannot enumerate another's
+		// staged datasets. `scope` is the resolved scope (caller guards on it).
+		const registryDo = doNamespace.get(
+			doNamespace.idFromName(scope ? `${scope}:__registry__` : "__registry__"),
+		);
+		await registryDo.fetch(
+			new Request(`${DO_FETCH_ORIGIN}/register`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					session_id: scope,
+					data_access_id: dataAccessId,
+					tool_name: toolName,
+					tables,
+					total_rows: totalRows,
+					tool_prefix: toolPrefix,
+				}),
+			}),
+		);
+	} catch (err) {
+		// Non-critical — don't fail staging if the registry write fails.
+		void err;
+	}
+}
+
+/**
  * Stage data to a Durable Object and return a structuredContent response
  * with the data_access_id for subsequent SQL queries.
  *
@@ -116,8 +186,14 @@ export interface StageResult {
  *   These are merged with server-side hints (client hints take precedence).
  * @param toolPrefix - Tool name prefix for query_data/get_schema tool names (e.g. "ctgov", "faers").
  *   If not provided, falls back to `prefix` (the data access ID prefix).
- * @param sessionId - MCP transport session ID. When provided, registers the staged dataset
- *   in a session-scoped registry so get_schema can list available datasets after context compaction.
+ * @param scope - Application-scope identifier. When provided, registers the staged dataset
+ *   in the `__registry__` DO so `<prefix>_get_schema` can enumerate it after context compaction.
+ *   Pass the tool handler's `extra` directly (preferred — picks up `_meta["dev.quentincody.bio/chatId"]` or the
+ *   `mcp-chat-id` header bridge), or a plain string for the legacy MCP transport session form.
+ *   Resolved through {@link getRequestScope}.
+ * @param options - Optional staging hints. `upstreamTotal` enables pagination
+ *   completeness detection; `workspace` routes staging into a shared WorkspaceDO
+ *   (see {@link StageOptions}).
  */
 export async function stageToDoAndRespond(
 	data: unknown,
@@ -126,15 +202,34 @@ export async function stageToDoAndRespond(
 	schemaHints?: SchemaHints,
 	provenance?: StagingProvenance,
 	toolPrefix?: string,
-	sessionId?: string,
+	scope?: string | MaybeExtra,
+	options?: StageOptions,
 ): Promise<StageResult> {
 	const dataAccessId = generateDataAccessId(prefix);
+	const payloadBytes = JSON.stringify(data).length;
+	const resolvedToolPrefix = toolPrefix ?? prefix;
+
+	// ADR-006 Phase 0 — workspace routing. Stage into the shared WorkspaceDO and
+	// return early; the per-server `/process` + `/register` path below is skipped
+	// so default-off behavior stays byte-for-byte unchanged.
+	const ws = options?.workspace;
+	if (ws) {
+		return stageIntoWorkspace(
+			data,
+			ws,
+			payloadBytes,
+			resolvedToolPrefix,
+			dataAccessId,
+			schemaHints,
+			provenance?.toolName,
+			options?.upstreamTotal,
+		);
+	}
+
 	const doId = doNamespace.idFromName(dataAccessId);
 	const doInstance = doNamespace.get(doId);
 
-	const payloadBytes = JSON.stringify(data).length;
-
-	const processReq = new Request("http://localhost/process", {
+	const processReq = new Request(`${DO_FETCH_ORIGIN}/process`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
@@ -145,47 +240,71 @@ export async function stageToDoAndRespond(
 	});
 
 	const processResp = await doInstance.fetch(processReq);
-	const processResult = await parseJsonResponse<ProcessResponse>(processResp, { success: false, error: "Empty response from DO" });
+	const processResult = await parseJsonResponse<ProcessResponse>(processResp, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!processResult.success) {
-		throw new Error(`Failed to stage data in Durable Object: ${processResult.error || "unknown error"}`);
+		throw new Error(
+			`Failed to stage data in Durable Object: ${processResult.error || "unknown error"}`,
+		);
 	}
 
 	// Fetch schema
 	const schemaResp = await doInstance.fetch(
-		new Request("http://localhost/schema"),
+		new Request(`${DO_FETCH_ORIGIN}/schema`),
 	);
-	const schemaResult = await parseJsonResponse<SchemaResponse>(schemaResp, { success: false });
+	const schemaResult = await parseJsonResponse<SchemaResponse>(schemaResp, {
+		success: false,
+	});
 
 	const tables = processResult.tables_created ?? [];
-	const resolvedToolPrefix = toolPrefix ?? prefix;
 	const primaryTable = tables[0];
 	const primaryTableRows = processResult.table_row_counts
-		? (primaryTable ? (processResult.table_row_counts[primaryTable] ?? 0) : undefined)
+		? primaryTable
+			? (processResult.table_row_counts[primaryTable] ?? 0)
+			: undefined
 		: undefined;
 
-	// Register in session registry if sessionId is available
-	if (sessionId) {
-		try {
-			const registryId = doNamespace.idFromName("__registry__");
-			const registryDo = doNamespace.get(registryId);
-			await registryDo.fetch(
-				new Request("http://localhost/register", {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({
-						session_id: sessionId,
-						data_access_id: dataAccessId,
-						tool_name: provenance?.toolName,
-						tables,
-						total_rows: processResult.total_rows,
-						tool_prefix: resolvedToolPrefix,
-					}),
-				}),
-			);
-		} catch {
-			// Non-critical — don't fail staging if registry write fails
-		}
+	// Compute a canonical completeness verdict for the staged set. Two signals,
+	// merged with pagination taking priority (it's usually the larger loss):
+	//   1. pagination — upstream reported more records than we staged
+	//   2. materialization — rows dropped while writing into SQLite
+	const warnings = processResult.staging_warnings ?? {};
+	const failedRows =
+		typeof warnings.rows_skipped === "number"
+			? warnings.rows_skipped
+			: undefined;
+	const dataLossWarning =
+		typeof warnings.data_loss_warning === "string"
+			? warnings.data_loss_warning
+			: undefined;
+	const completeness: Completeness | undefined = mergeCompleteness(
+		paginationCompleteness(options?.upstreamTotal, primaryTableRows),
+		deriveMaterializationCompleteness({
+			inputRows: processResult.input_rows,
+			failedRows,
+			returned: primaryTableRows,
+			dataLossWarning,
+		}),
+	);
+
+	// Register in the per-server `__registry__` DO so get_schema can list it later.
+	// `scope` may arrive as a string (legacy callers) or as the full `extra` object
+	// (preferred). The DO column is still called `session_id` for back-compat; only
+	// the *value's meaning* has shifted from MCP transport session to app scope.
+	const resolvedScope = getRequestScope(scope);
+	if (resolvedScope) {
+		await registerStagedDataset(
+			doNamespace,
+			resolvedScope,
+			dataAccessId,
+			tables,
+			processResult.total_rows,
+			resolvedToolPrefix,
+			provenance?.toolName,
+		);
 	}
 
 	return {
@@ -205,6 +324,7 @@ export async function stageToDoAndRespond(
 			payloadSizeBytes: payloadBytes,
 			toolPrefix: resolvedToolPrefix,
 			relationships: processResult.relationships,
+			completeness,
 		}),
 	};
 }
@@ -235,14 +355,29 @@ export async function queryDataFromDo(
 	if (sanitizedSql.split(";").filter(Boolean).length > 1) {
 		throw new Error("Only single SQL statements are allowed");
 	}
-
+	// T3.4 — a read-only PRAGMA table_info(<table>) describe is allowed past the
+	// SELECT-only / no-PRAGMA rules so a model can learn a staged table's columns.
+	const isDescribe = /^pragma\s+table_info\s*\(/i.test(sanitizedSql);
 	const dangerousKeywords = [
-		"DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE",
-		"TRUNCATE", "REPLACE", "EXEC", "EXECUTE", "PRAGMA",
-		"ATTACH", "DETACH", "REINDEX", "VACUUM", "ANALYZE",
+		"DROP",
+		"DELETE",
+		"INSERT",
+		"UPDATE",
+		"ALTER",
+		"CREATE",
+		"TRUNCATE",
+		"REPLACE",
+		"EXEC",
+		"EXECUTE",
+		"PRAGMA",
+		"ATTACH",
+		"DETACH",
+		"REINDEX",
+		"VACUUM",
+		"ANALYZE",
 	];
 	const upperSql = sanitizedSql.toUpperCase();
-	for (const keyword of dangerousKeywords) {
+	for (const keyword of isDescribe ? [] : dangerousKeywords) {
 		// Use word-boundary regex to avoid false positives on column names
 		// like "created_at" matching CREATE, "updated_at" matching UPDATE, etc.
 		const regex = new RegExp(`\\b${keyword}\\b`);
@@ -252,13 +387,11 @@ export async function queryDataFromDo(
 			);
 		}
 	}
-
-	if (!/^\s*(SELECT|WITH)\b/i.test(sanitizedSql)) {
+	if (!/^\s*(SELECT|WITH|PRAGMA\s+table_info)\b/i.test(sanitizedSql)) {
 		throw new Error("Only SELECT/WITH queries are allowed");
 	}
-
 	let finalSql = sanitizedSql;
-	if (!sanitizedSql.toLowerCase().includes("limit")) {
+	if (!isDescribe && !sanitizedSql.toLowerCase().includes("limit")) {
 		finalSql += ` LIMIT ${limit}`;
 	}
 
@@ -273,7 +406,9 @@ export async function queryDataFromDo(
 	//   { success: true, schema: { table_count: N, tables: { "tbl1": {...}, ... } } }
 	// NOT an array. Check tables map keys (ignoring internal names).
 	try {
-		const probe = await doInstance.fetch(new Request("http://localhost/schema"));
+		const probe = await doInstance.fetch(
+			new Request(`${DO_FETCH_ORIGIN}/schema`),
+		);
 		if (probe.ok) {
 			const probeJson = (await probe.json()) as {
 				schema?: { tables?: Record<string, unknown>; table_count?: number };
@@ -301,19 +436,23 @@ export async function queryDataFromDo(
 	}
 
 	const response = await doInstance.fetch(
-		new Request("http://localhost/query", {
+		new Request(`${DO_FETCH_ORIGIN}/query`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ sql: finalSql, count_total: true }),
 		}),
 	);
 
-	const result = await parseJsonResponse<QueryResponse>(response, { success: false, error: "Empty response from DO" });
+	const result = await parseJsonResponse<QueryResponse>(response, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!result.success) {
 		const err = new Error(`Query failed: ${result.error || "Unknown error"}`);
 		if (result.diagnostics) {
-			(err as Error & { diagnostics: typeof result.diagnostics }).diagnostics = result.diagnostics;
+			(err as Error & { diagnostics: typeof result.diagnostics }).diagnostics =
+				result.diagnostics;
 		}
 		if (result.validated) {
 			(err as Error & { validated: boolean }).validated = true;
@@ -323,9 +462,11 @@ export async function queryDataFromDo(
 
 	return {
 		rows: result.results ?? [],
-		row_count: result.row_count ?? (result.results?.length ?? 0),
+		row_count: result.row_count ?? result.results?.length ?? 0,
 		...(result.truncated !== undefined ? { truncated: result.truncated } : {}),
-		...(result.total_matching !== undefined ? { total_matching: result.total_matching } : {}),
+		...(result.total_matching !== undefined
+			? { total_matching: result.total_matching }
+			: {}),
 		sql: finalSql,
 		data_access_id: dataAccessId,
 		executed_at: new Date().toISOString(),
@@ -347,9 +488,12 @@ export async function getSchemaFromDo(
 	const doInstance = doNamespace.get(doId);
 
 	const response = await doInstance.fetch(
-		new Request("http://localhost/schema"),
+		new Request(`${DO_FETCH_ORIGIN}/schema`),
 	);
-	const result = await parseJsonResponse<SchemaResponse>(response, { success: false, error: "Empty response from DO" });
+	const result = await parseJsonResponse<SchemaResponse>(response, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!result.success) {
 		throw new Error(`Schema retrieval failed: ${result.error}`);
@@ -371,146 +515,5 @@ export async function getSchemaFromDo(
 		data_access_id: dataAccessId,
 		schema,
 		retrieved_at: new Date().toISOString(),
-	};
-}
-
-/**
- * Standard query_data tool handler. Use in registerTool callback.
- */
-export function createQueryDataHandler(
-	doBindingName: string,
-	toolPrefix: string,
-): (args: Record<string, unknown>, env: Record<string, unknown>) => Promise<CodeModeResponse<SuccessResponse<unknown>> | CodeModeResponse<ErrorResponse>> {
-	return async (
-		args: Record<string, unknown>,
-		env: Record<string, unknown>,
-	) => {
-		const doNamespace = env[doBindingName] as DurableObjectNamespace | undefined;
-		if (!doNamespace) {
-			return createCodeModeError(
-				"DATA_ACCESS_ERROR",
-				`${doBindingName} environment not available`,
-			);
-		}
-
-		try {
-			const dataAccessId = String(args.data_access_id || "");
-			const sql = String(args.sql || "");
-			const limit = Number(args.limit) || 100;
-
-			if (!dataAccessId) throw new Error("data_access_id is required");
-			if (!sql) throw new Error("sql is required");
-
-			const result = await queryDataFromDo(doNamespace, dataAccessId, sql, limit);
-			const queryResult = result as Record<string, unknown>;
-			return createCodeModeResponse(result, {
-				meta: {
-					data_access_id: result.data_access_id,
-					row_count: result.row_count,
-					...(queryResult.truncated !== undefined ? { truncated: queryResult.truncated } : {}),
-					...(queryResult.total_matching !== undefined ? { total_matching: queryResult.total_matching } : {}),
-					executed_at: result.executed_at,
-				},
-			});
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			let code = "SQL_EXECUTION_ERROR";
-			if (msg.includes("not allowed")) code = "INVALID_SQL";
-			if (msg.includes("not found") || msg.includes("not available"))
-				code = "DATA_ACCESS_ERROR";
-			if (err instanceof Error && "validated" in err) code = "SQL_VALIDATION_ERROR";
-			return createCodeModeError(code, `${toolPrefix}_query_data failed: ${msg}`);
-		}
-	};
-}
-
-/**
- * Standard get_schema tool handler. Use in registerTool callback.
- *
- * When `data_access_id` is provided, returns the schema for that specific dataset.
- * When omitted, uses the MCP session to list all staged datasets available in this session.
- */
-export function createGetSchemaHandler(
-	doBindingName: string,
-	toolPrefix: string,
-): (args: Record<string, unknown>, env: Record<string, unknown>, sessionId?: string) => Promise<CodeModeResponse<SuccessResponse<unknown>> | CodeModeResponse<ErrorResponse>> {
-	return async (
-		args: Record<string, unknown>,
-		env: Record<string, unknown>,
-		sessionId?: string,
-	) => {
-		const doNamespace = env[doBindingName] as DurableObjectNamespace | undefined;
-		if (!doNamespace) {
-			return createCodeModeError(
-				"DATA_ACCESS_ERROR",
-				`${doBindingName} environment not available`,
-			);
-		}
-
-		const dataAccessId = String(args.data_access_id || "");
-
-		// If data_access_id is provided, return schema for that specific dataset
-		if (dataAccessId) {
-			try {
-				const result = await getSchemaFromDo(doNamespace, dataAccessId);
-				return createCodeModeResponse(result, {
-					textSummary: JSON.stringify(result),
-				});
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				return createCodeModeError(
-					"DATA_ACCESS_ERROR",
-					`${toolPrefix}_get_schema failed: ${msg}`,
-				);
-			}
-		}
-
-		// No data_access_id — list available staged datasets for this session
-		try {
-			const registryId = doNamespace.idFromName("__registry__");
-			const registryDo = doNamespace.get(registryId);
-			const listResp = await registryDo.fetch(
-				new Request(`http://localhost/list?session_id=${encodeURIComponent(sessionId || "")}`),
-			);
-			const listResult = await parseJsonResponse<ListResponse>(listResp, { success: false });
-
-			const datasets = listResult.datasets ?? [];
-
-			if (datasets.length === 0) {
-				return createCodeModeResponse(
-					{
-						staged_datasets: [],
-						message: "No staged datasets found for this session. Data may have been staged in a previous session, or no tools have returned large enough responses to trigger staging yet.",
-					},
-					{ textSummary: "No staged datasets found for this session." },
-				);
-			}
-
-			const listing = datasets.map((d) => ({
-				data_access_id: d.data_access_id,
-				tool_name: d.tool_name,
-				tables: d.tables,
-				total_rows: d.total_rows,
-				query_tool: `${d.tool_prefix || toolPrefix}_query_data`,
-				schema_tool: `${d.tool_prefix || toolPrefix}_get_schema`,
-				created_at: d.created_at,
-			}));
-
-			return createCodeModeResponse(
-				{
-					staged_datasets: listing,
-					hint: "Call this tool with a specific data_access_id to get the full schema for that dataset.",
-				},
-				{
-					textSummary: `Found ${listing.length} staged dataset(s) in this session:\n${listing.map((d) => `  - ${d.data_access_id} (${d.tool_name || "unknown"}, ${d.total_rows ?? "?"} rows, tables: ${d.tables.join(", ")})`).join("\n")}`,
-				},
-			);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			return createCodeModeError(
-				"DATA_ACCESS_ERROR",
-				`${toolPrefix}_get_schema listing failed: ${msg}`,
-			);
-		}
 	};
 }

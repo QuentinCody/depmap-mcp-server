@@ -16,24 +16,35 @@
 
 import { z } from "zod";
 import {
-	DynamicWorkerExecutor,
-	type WorkerLoaderBinding,
-	type ExecutorFns,
-} from "./execute-tool";
-import { buildSparqlProxySource } from "./sparql-proxy";
+	buildCitation,
+	type Citation,
+	type SourceDescriptor,
+} from "../provenance/provenance";
+import { getRequestScope, type MaybeExtra } from "../registry/request-scope";
+import type { ToolContext } from "../registry/types";
+import { createQueryProxyTool, createStageProxyTool } from "../tools/api-proxy";
+import { createFsProxyHandlers } from "../tools/fs-proxy";
+import { createSparqlProxyTool } from "../tools/sparql-proxy";
 import {
-	COMMON_PREFIXES,
+	DynamicWorkerExecutor,
+	type ExecutorFns,
+	type WorkerLoaderBinding,
+} from "./execute-tool";
+import { buildFsProxySource } from "./fs-proxy";
+import {
+	createCodeModeError,
+	createCodeModeResponse,
+	ErrorCodes,
+} from "./response";
+import {
 	buildPrefixHeader,
+	COMMON_PREFIXES,
 	probeSparqlEndpoint,
 	type SparqlEndpointDescription,
 	type SparqlFetchFn,
 } from "./sparql-introspection";
-import { createSparqlProxyTool } from "../tools/sparql-proxy";
-import { createQueryProxyTool, createStageProxyTool } from "../tools/api-proxy";
-import { createFsProxyHandlers } from "../tools/fs-proxy";
-import { buildFsProxySource } from "./fs-proxy";
-import type { ToolContext } from "../registry/types";
-import { createCodeModeResponse, createCodeModeError, ErrorCodes } from "./response";
+import { buildSparqlProxySource } from "./sparql-proxy";
+import { registerVerifyCitationOnce } from "./verify-citation-tool";
 
 export interface SparqlExecuteToolOptions {
 	/** Tool name prefix (e.g., "bgee" → "bgee_execute") */
@@ -60,6 +71,51 @@ export interface SparqlExecuteToolOptions {
 	apiName?: string;
 	/** Custom prefix map to inject into isolate (defaults to COMMON_PREFIXES) */
 	prefixes?: Record<string, string>;
+	/** Canonical upstream source identity. When declared, every result carries a
+	 *  verifiable `_meta.citation` (source + query/result hashes + timestamp) so a
+	 *  connected agent can attribute and re-verify each claim. Opt-in per server. */
+	source?: SourceDescriptor;
+}
+
+// ---------------------------------------------------------------------------
+// Provenance / citation context (shared with GraphQL/REST execute-tool pattern)
+// ---------------------------------------------------------------------------
+
+/** Provenance context threaded from the factory options into result handling. */
+interface CitationCtx {
+	source?: SourceDescriptor;
+	server: string;
+	tool: string;
+	query: unknown;
+}
+
+/** Records returned, for the citation: staged total_rows, else array length. */
+function countRecords(data: unknown, totalRows: unknown): number | undefined {
+	if (typeof totalRows === "number") return totalRows;
+	if (Array.isArray(data)) return data.length;
+	return undefined;
+}
+
+/** Build the optional `citation` meta when the server declared a source. */
+async function buildCitationMeta(
+	prov: CitationCtx | undefined,
+	data: unknown,
+	recordCount: number | undefined,
+	dataAccessId: string | undefined,
+	retrievedAt: string,
+): Promise<{ citation?: Citation }> {
+	if (!prov?.source) return {};
+	const citation = await buildCitation({
+		source: prov.source,
+		server: prov.server,
+		tool: prov.tool,
+		query: prov.query,
+		result: data,
+		retrievedAt,
+		recordCount,
+		dataAccessId,
+	});
+	return { citation };
 }
 
 export interface SparqlExecuteToolResult {
@@ -85,7 +141,9 @@ function validateLoader(rawLoader: unknown): WorkerLoaderBinding {
 		!("get" in rawLoader) ||
 		typeof (rawLoader as WorkerLoaderBinding).get !== "function"
 	) {
-		throw new Error("createSparqlExecuteTool requires a valid Worker Loader binding");
+		throw new Error(
+			"createSparqlExecuteTool requires a valid Worker Loader binding",
+		);
 	}
 	return rawLoader as WorkerLoaderBinding;
 }
@@ -99,15 +157,27 @@ function toInput(args: unknown): Record<string, unknown> {
 	return {};
 }
 
-function buildEndpointSummary(d: SparqlEndpointDescription | undefined): string {
+function buildEndpointSummary(
+	d: SparqlEndpointDescription | undefined,
+): string {
 	if (!d) {
 		return "Endpoint shape not yet probed. Start with small SELECT/ASK queries and add LIMIT early.";
 	}
 	const parts: string[] = [];
-	if (d.graphs.length > 0) parts.push(`Named graphs (${d.graphs.length}): ${d.graphs.slice(0, 8).join(", ")}${d.graphs.length > 8 ? ", ..." : ""}`);
-	if (d.predicates.length > 0) parts.push(`Sample predicates: ${d.predicates.slice(0, 12).join(", ")}${d.predicates.length > 12 ? ", ..." : ""}`);
-	if (d.classes.length > 0) parts.push(`Sample classes (rdf:type values): ${d.classes.slice(0, 8).join(", ")}${d.classes.length > 8 ? ", ..." : ""}`);
-	if (d.warnings.length > 0) parts.push(`Probe warnings: ${d.warnings.join("; ")}`);
+	if (d.graphs.length > 0)
+		parts.push(
+			`Named graphs (${d.graphs.length}): ${d.graphs.slice(0, 8).join(", ")}${d.graphs.length > 8 ? ", ..." : ""}`,
+		);
+	if (d.predicates.length > 0)
+		parts.push(
+			`Sample predicates: ${d.predicates.slice(0, 12).join(", ")}${d.predicates.length > 12 ? ", ..." : ""}`,
+		);
+	if (d.classes.length > 0)
+		parts.push(
+			`Sample classes (rdf:type values): ${d.classes.slice(0, 8).join(", ")}${d.classes.length > 8 ? ", ..." : ""}`,
+		);
+	if (d.warnings.length > 0)
+		parts.push(`Probe warnings: ${d.warnings.join("; ")}`);
 	return parts.join("\n");
 }
 
@@ -135,7 +205,9 @@ function buildDescription(
 		`- prefixes — object of common ontology prefixes (rdfs, owl, xsd, skos, dcterms, void, obo, uberon, go, ncbigene, efo, obi, sio, up, ensembl, bgee)\n` +
 		`- prefixHeader — pre-built \`PREFIX …\` block to prepend to your queries\n` +
 		`- console logging (log, warn, error, info) — captured output\n` +
-		(fsDoNamespace ? `- fs.readFile / fs.writeFile / fs.glob ... — persistent virtual filesystem\n` : "") +
+		(fsDoNamespace
+			? `- fs.readFile / fs.writeFile / fs.glob ... — persistent virtual filesystem\n`
+			: "") +
 		(preamble ? `\nDomain-specific notes are documented below.\n` : "") +
 		`\nThe last expression or return value is the result.\n\n` +
 		`ENDPOINT SHAPE:\n${endpointSummary}\n\n` +
@@ -200,7 +272,10 @@ interface ExecutionContext {
 async function ensureDescription(ctx: ExecutionContext): Promise<void> {
 	if (!ctx.cache.description) {
 		try {
-			ctx.cache.description = await probeSparqlEndpoint(ctx.options.endpointUrl, ctx.sparqlFetch);
+			ctx.cache.description = await probeSparqlEndpoint(
+				ctx.options.endpointUrl,
+				ctx.sparqlFetch,
+			);
 		} catch (err) {
 			ctx.cache.description = {
 				endpointUrl: ctx.options.endpointUrl,
@@ -219,7 +294,11 @@ async function ensureDescription(ctx: ExecutionContext): Promise<void> {
 	}
 }
 
-async function executeCode(ctx: ExecutionContext, code: string, sessionId: string | undefined) {
+async function executeCode(
+	ctx: ExecutionContext,
+	code: string,
+	sessionId: string | undefined,
+) {
 	await ensureDescription(ctx);
 	const wrappedCode = wrapUserCode({
 		prefixesSource: ctx.prefixesSource,
@@ -228,9 +307,20 @@ async function executeCode(ctx: ExecutionContext, code: string, sessionId: strin
 		preamble: ctx.preamble,
 		includeFsProxy: ctx.includeFsProxy,
 	});
-	const executor = new DynamicWorkerExecutor({ loader: ctx.loader, timeout: ctx.timeout });
-	const result = await executor.execute(wrappedCode, ctx.buildExecutorFns(sessionId));
-	return handleExecutorResult(result);
+	const executor = new DynamicWorkerExecutor({
+		loader: ctx.loader,
+		timeout: ctx.timeout,
+	});
+	const result = await executor.execute(
+		wrappedCode,
+		ctx.buildExecutorFns(sessionId),
+	);
+	return await handleExecutorResult(result, {
+		source: ctx.options.source,
+		server: ctx.options.prefix,
+		tool: `${ctx.options.prefix}_execute`,
+		query: code,
+	});
 }
 
 function createExecutorFnsBuilder(
@@ -239,29 +329,42 @@ function createExecutorFnsBuilder(
 	prefix: string,
 	fsDoNamespace: unknown,
 ): (sessionId: string | undefined) => ExecutorFns {
-	const queryProxyTool = doNamespace ? createQueryProxyTool({ doNamespace }) : undefined;
+	const queryProxyTool = doNamespace
+		? createQueryProxyTool({ doNamespace })
+		: undefined;
 	const stageProxyTool = doNamespace
 		? createStageProxyTool({ doNamespace, stagingPrefix: prefix })
 		: undefined;
 	const fsHandlers: ExecutorFns = fsDoNamespace
 		? createFsProxyHandlers({
-				doNamespace: fsDoNamespace as Parameters<typeof createFsProxyHandlers>[0]["doNamespace"],
+				doNamespace: fsDoNamespace as Parameters<
+					typeof createFsProxyHandlers
+				>[0]["doNamespace"],
 			})
 		: {};
 
 	return (sessionId: string | undefined) => {
 		const ctx: ToolContext = { sql: () => [], sessionId };
 		return {
-			__sparql_proxy: async (args: unknown) => sparqlProxyTool.handler(toInput(args), ctx),
+			__sparql_proxy: async (args: unknown) =>
+				sparqlProxyTool.handler(toInput(args), ctx),
 			__query_proxy: async (args: unknown) => {
 				if (!queryProxyTool) {
-					return { __query_error: true, message: "Staged data querying is not available (no DO namespace configured)" };
+					return {
+						__query_error: true,
+						message:
+							"Staged data querying is not available (no DO namespace configured)",
+					};
 				}
 				return queryProxyTool.handler(toInput(args), ctx);
 			},
 			__stage_proxy: async (args: unknown) => {
 				if (!stageProxyTool) {
-					return { __stage_error: true, message: "Data staging is not available (no DO namespace configured)" };
+					return {
+						__stage_error: true,
+						message:
+							"Data staging is not available (no DO namespace configured)",
+					};
 				}
 				return stageProxyTool.handler(toInput(args), ctx);
 			},
@@ -270,7 +373,9 @@ function createExecutorFnsBuilder(
 	};
 }
 
-export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): SparqlExecuteToolResult {
+export function createSparqlExecuteTool(
+	options: SparqlExecuteToolOptions,
+): SparqlExecuteToolResult {
 	const {
 		prefix,
 		sparqlFetch,
@@ -291,7 +396,12 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 		stagingPrefix: prefix,
 		stagingThreshold,
 	});
-	const buildExecutorFns = createExecutorFnsBuilder(sparqlProxyTool, doNamespace, prefix, fsDoNamespace);
+	const buildExecutorFns = createExecutorFnsBuilder(
+		sparqlProxyTool,
+		doNamespace,
+		prefix,
+		fsDoNamespace,
+	);
 
 	const ctx: ExecutionContext = {
 		sparqlFetch,
@@ -306,17 +416,22 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 		cache: { description: options.description, toolDescription: undefined },
 	};
 
-	const initialDescription = buildDescription(options, buildEndpointSummary(options.description));
+	const initialDescription = buildDescription(
+		options,
+		buildEndpointSummary(options.description),
+	);
 
 	return {
 		name: toolName,
 		description: initialDescription,
 		schema: {
-			code: z.string().describe(
-				"JavaScript code to execute. Use sparql.query() for SELECT/CONSTRUCT/DESCRIBE and sparql.ask() for ASK. " +
-				"The last expression or return value becomes the result. " +
-				"Example: const rows = await sparql.query(prefixHeader + ' SELECT ?s WHERE { ?s a owl:Class } LIMIT 10'); return rows;",
-			),
+			code: z
+				.string()
+				.describe(
+					"JavaScript code to execute. Use sparql.query() for SELECT/CONSTRUCT/DESCRIBE and sparql.ask() for ASK. " +
+						"The last expression or return value becomes the result. " +
+						"Example: const rows = await sparql.query(prefixHeader + ' SELECT ?s WHERE { ?s a owl:Class } LIMIT 10'); return rows;",
+				),
 		},
 
 		async register(
@@ -328,44 +443,82 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 			// (Bgee's Virtuoso is slow on VOID/probe queries). The shape is
 			// still probed lazily on first execute and cached thereafter; the
 			// tool description carries the standard guidance instead.
-			server.tool(toolName, this.description, this.schema, async (input: { code: string }, extra: unknown) => {
-				const code = input.code?.trim();
-				if (!code) {
-					return createCodeModeError(ErrorCodes.INVALID_ARGUMENTS, "code is required");
-				}
-				try {
-					const sessionId = (extra as { sessionId?: string } | undefined)?.sessionId;
-					return await executeCode(ctx, code, sessionId);
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					return createCodeModeError(ErrorCodes.UNKNOWN_ERROR, `${prefix}_execute failed: ${message}`);
-				}
-			});
+			server.tool(
+				toolName,
+				this.description,
+				this.schema,
+				async (input: { code: string }, extra: unknown) => {
+					const code = input.code?.trim();
+					if (!code) {
+						return createCodeModeError(
+							ErrorCodes.INVALID_ARGUMENTS,
+							"code is required",
+						);
+					}
+					try {
+						const scope = getRequestScope(extra as MaybeExtra | undefined);
+						return await executeCode(ctx, code, scope);
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						return createCodeModeError(
+							ErrorCodes.UNKNOWN_ERROR,
+							`${prefix}_execute failed: ${message}`,
+						);
+					}
+				},
+			);
+
+			// Sibling provenance tool: results carry `_meta.citation` integrity
+			// anchors, so the server must also expose the means to re-check them.
+			registerVerifyCitationOnce(server);
 		},
 	};
 }
 
-function handleExecutorResult(
-	result: { result?: unknown; error?: string; logs?: string[]; __stagedResults?: Array<Record<string, unknown>> },
+async function handleExecutorResult(
+	result: {
+		result?: unknown;
+		error?: string;
+		logs?: string[];
+		__stagedResults?: Array<Record<string, unknown>>;
+	},
+	prov?: CitationCtx,
 ) {
+	const retrievedAt = new Date().toISOString();
+
 	if (result.error) {
 		if (result.__stagedResults?.length) {
 			const staged = result.__stagedResults[result.__stagedResults.length - 1];
-			const logOutput = result.logs?.length ? result.logs.join("\n") : undefined;
+			const logOutput = result.logs?.length
+				? result.logs.join("\n")
+				: undefined;
 			const { schema: _s, _staging: _st, ...slim } = staged;
+			const cite = await buildCitationMeta(
+				prov,
+				slim,
+				staged.total_rows as number | undefined,
+				staged.data_access_id as string | undefined,
+				retrievedAt,
+			);
 			return createCodeModeResponse(slim, {
 				meta: {
 					staged: true,
 					data_access_id: staged.data_access_id as string,
 					tables_created: staged.tables_created,
 					total_rows: staged.total_rows,
+					...cite,
 					...(logOutput ? { console_output: logOutput } : {}),
-					executed_at: new Date().toISOString(),
+					executed_at: retrievedAt,
 				},
 			});
 		}
-		const logOutput = result.logs?.length ? `\n\nConsole output:\n${result.logs.join("\n")}` : "";
-		return createCodeModeError(ErrorCodes.API_ERROR, `${result.error}${logOutput}`);
+		const logOutput = result.logs?.length
+			? `\n\nConsole output:\n${result.logs.join("\n")}`
+			: "";
+		return createCodeModeError(
+			ErrorCodes.API_ERROR,
+			`${result.error}${logOutput}`,
+		);
 	}
 
 	const logOutput = result.logs?.length ? result.logs.join("\n") : undefined;
@@ -387,11 +540,19 @@ function handleExecutorResult(
 		const { schema: _s, _staging: _st, ...slim } = resultObj;
 		responseData = slim;
 	}
+	const cite = await buildCitationMeta(
+		prov,
+		responseData,
+		countRecords(responseData, stagingMeta.total_rows),
+		stagingMeta.data_access_id as string | undefined,
+		retrievedAt,
+	);
 	return createCodeModeResponse(responseData, {
 		meta: {
 			...stagingMeta,
+			...cite,
 			...(logOutput ? { console_output: logOutput } : {}),
-			executed_at: new Date().toISOString(),
+			executed_at: retrievedAt,
 		},
 	});
 }

@@ -53,6 +53,8 @@ export function registerCodeMode(server: McpServer, env: CodeModeEnv): void {
 
     const executeTool = createExecuteTool({
         prefix: "depmap",
+        // Verifiable provenance: depmap_execute results carry a _meta.citation.
+        source: { id: "depmap", name: "DepMap (Cancer Dependency Map)", url: "https://depmap.org", license: "CC BY 4.0" },
         catalog: depmapCatalog,
         apiFetch,
         doNamespace: env.DEPMAP_DATA_DO,

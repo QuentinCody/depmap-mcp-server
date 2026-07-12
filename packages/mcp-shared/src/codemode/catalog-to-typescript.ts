@@ -67,7 +67,7 @@ function endpointScore(ep: ApiEndpoint): number {
 	let score = 0;
 	// Endpoints with more params tend to be more important/specific
 	score += (ep.pathParams?.length || 0) * 2;
-	score += (ep.queryParams?.length || 0);
+	score += ep.queryParams?.length || 0;
 	// GET is the most common operation
 	if (ep.method === "GET") score += 1;
 	// Covered-by-tool means it's important enough to have a dedicated tool
@@ -171,7 +171,9 @@ export function catalogToTypeScript(
 
 	const lines: string[] = [];
 
-	lines.push(`API REFERENCE (${catalog.name}, ${selected.length} of ${catalog.endpointCount} endpoints):`);
+	lines.push(
+		`API REFERENCE (${catalog.name}, ${selected.length} of ${catalog.endpointCount} endpoints):`,
+	);
 
 	for (const [category, eps] of groups) {
 		lines.push(`  ${category}:`);
@@ -183,7 +185,9 @@ export function catalogToTypeScript(
 
 	const omitted = catalog.endpointCount - selected.length;
 	if (omitted > 0) {
-		lines.push(`  ... ${omitted} more endpoints — use searchSpec(query) in your code to discover them`);
+		lines.push(
+			`  ... ${omitted} more endpoints — use searchSpec(query) in your code to discover them`,
+		);
 	}
 
 	return lines.join("\n");
@@ -209,115 +213,114 @@ interface SpecOperation {
 	requestBody?: { content?: Record<string, unknown> };
 }
 
-/**
- * Generate a compact API summary from a resolved OpenAPI spec.
- */
-export function specToTypeScript(
-	spec: ResolvedSpec,
-	options?: CatalogSummaryOptions,
-): string {
-	const maxEndpoints = options?.maxEndpoints ?? 20;
-	const HTTP_METHODS = ["get", "post", "put", "delete", "patch"];
+interface OpEntry {
+	method: string;
+	path: string;
+	summary: string;
+	tag: string;
+	params: string;
+	score: number;
+}
 
-	// Collect all operations
-	interface OpEntry {
-		method: string;
-		path: string;
-		summary: string;
-		tag: string;
-		params: string;
-		score: number;
+const SPEC_HTTP_METHODS = ["get", "post", "put", "delete", "patch"];
+
+/** Format an operation's parameter list: required then optional, small enums inlined. */
+function formatSpecOpParams(allParams: SpecParam[], hasBody: boolean): string {
+	const required: string[] = [];
+	const optional: string[] = [];
+	for (const p of allParams) {
+		if (!p.name) continue;
+		const suffix = p.required ? "" : "?";
+		const bucket = p.required ? required : optional;
+		const enumValues = p.schema?.enum || p.enum;
+		if (enumValues && Array.isArray(enumValues) && enumValues.length <= 5) {
+			const values = enumValues.map((v) => JSON.stringify(v)).join("|");
+			bucket.push(`${p.name}${suffix}: ${values}`);
+		} else {
+			bucket.push(`${p.name}${suffix}`);
+		}
 	}
+	const parts: string[] = [];
+	if (required.length > 0) parts.push(required.join(", "));
+	if (optional.length > 0) parts.push(optional.join(", "));
+	if (parts.length === 0 && hasBody) parts.push("body: JSON");
+	return parts.length > 0 ? ` (${parts.join("; ")})` : "";
+}
 
+/** Flatten spec.paths into scored OpEntry rows. */
+function collectSpecOperations(spec: ResolvedSpec): OpEntry[] {
 	const ops: OpEntry[] = [];
 	for (const [path, pathItem] of Object.entries(spec.paths)) {
 		if (!pathItem || typeof pathItem !== "object") continue;
-		const pathParams: SpecParam[] = Array.isArray((pathItem as Record<string, unknown>).parameters)
-			? (pathItem as Record<string, unknown>).parameters as SpecParam[]
+		const pathParams: SpecParam[] = Array.isArray(
+			(pathItem as Record<string, unknown>).parameters,
+		)
+			? ((pathItem as Record<string, unknown>).parameters as SpecParam[])
 			: [];
 
-		for (const method of HTTP_METHODS) {
-			const op = (pathItem as Record<string, unknown>)[method] as SpecOperation | undefined;
+		for (const method of SPEC_HTTP_METHODS) {
+			const op = (pathItem as Record<string, unknown>)[method] as
+				| SpecOperation
+				| undefined;
 			if (!op || typeof op !== "object") continue;
 
 			const allParams = [...pathParams, ...(op.parameters || [])];
-			const required: string[] = [];
-			const optional: string[] = [];
-
-			for (const p of allParams) {
-				if (!p.name) continue;
-				const suffix = p.required ? "" : "?";
-				const enumValues = p.schema?.enum || p.enum;
-				if (enumValues && Array.isArray(enumValues) && enumValues.length <= 5) {
-					const values = enumValues.map((v) => JSON.stringify(v)).join("|");
-					(p.required ? required : optional).push(`${p.name}${suffix}: ${values}`);
-				} else {
-					(p.required ? required : optional).push(`${p.name}${suffix}`);
-				}
-			}
-
-			const parts: string[] = [];
-			if (required.length > 0) parts.push(required.join(", "));
-			if (optional.length > 0) parts.push(optional.join(", "));
-			if (parts.length === 0 && op.requestBody) parts.push("body: JSON");
-
-			const paramStr = parts.length > 0 ? ` (${parts.join("; ")})` : "";
-			const summary = op.summary || op.operationId || op.description?.slice(0, 60) || "";
-			const tag = op.tags?.[0] || "general";
-
 			ops.push({
 				method: method.toUpperCase(),
 				path,
-				summary,
-				tag,
-				params: paramStr,
+				summary:
+					op.summary || op.operationId || op.description?.slice(0, 60) || "",
+				tag: op.tags?.[0] || "general",
+				params: formatSpecOpParams(allParams, Boolean(op.requestBody)),
 				score: allParams.length + (method === "get" ? 1 : 0),
 			});
 		}
 	}
+	return ops;
+}
 
-	if (ops.length === 0) return "";
+/** Pick up to maxEndpoints: the best operation per tag first, then fill by score. */
+function selectSpecOperations(ops: OpEntry[], maxEndpoints: number): OpEntry[] {
+	if (ops.length <= maxEndpoints) return [...ops];
 
-	// Select operations: one per tag first, then fill by score
 	const selected: OpEntry[] = [];
 	const selectedKeys = new Set<string>();
-
-	if (ops.length <= maxEndpoints) {
-		selected.push(...ops);
-	} else {
-		// One per tag
-		const tagBest = new Map<string, OpEntry>();
-		for (const op of ops) {
-			const current = tagBest.get(op.tag);
-			if (!current || op.score > current.score) {
-				tagBest.set(op.tag, op);
-			}
+	const pushUnique = (op: OpEntry) => {
+		const key = `${op.method} ${op.path}`;
+		if (!selectedKeys.has(key)) {
+			selectedKeys.add(key);
+			selected.push(op);
 		}
-		for (const op of tagBest.values()) {
-			if (selected.length >= maxEndpoints) break;
-			const key = `${op.method} ${op.path}`;
-			if (!selectedKeys.has(key)) {
-				selectedKeys.add(key);
-				selected.push(op);
-			}
-		}
+	};
 
-		// Fill remaining by score
-		const remaining = ops
-			.filter((op) => !selectedKeys.has(`${op.method} ${op.path}`))
-			.sort((a, b) => b.score - a.score);
-
-		for (const op of remaining) {
-			if (selected.length >= maxEndpoints) break;
-			const key = `${op.method} ${op.path}`;
-			if (!selectedKeys.has(key)) {
-				selectedKeys.add(key);
-				selected.push(op);
-			}
+	const tagBest = new Map<string, OpEntry>();
+	for (const op of ops) {
+		const current = tagBest.get(op.tag);
+		if (!current || op.score > current.score) {
+			tagBest.set(op.tag, op);
 		}
 	}
+	for (const op of tagBest.values()) {
+		if (selected.length >= maxEndpoints) break;
+		pushUnique(op);
+	}
 
-	// Group by tag
+	const remaining = ops
+		.filter((op) => !selectedKeys.has(`${op.method} ${op.path}`))
+		.sort((a, b) => b.score - a.score);
+	for (const op of remaining) {
+		if (selected.length >= maxEndpoints) break;
+		pushUnique(op);
+	}
+	return selected;
+}
+
+/** Render the tag-grouped summary block, noting how many operations were omitted. */
+function renderSpecSummary(
+	title: string,
+	ops: OpEntry[],
+	selected: OpEntry[],
+): string {
 	const groups = new Map<string, OpEntry[]>();
 	for (const op of selected) {
 		const list = groups.get(op.tag) || [];
@@ -325,10 +328,10 @@ export function specToTypeScript(
 		groups.set(op.tag, list);
 	}
 
-	const title = spec.info?.title || "API";
 	const lines: string[] = [];
-	lines.push(`API REFERENCE (${title}, ${selected.length} of ${ops.length} operations):`);
-
+	lines.push(
+		`API REFERENCE (${title}, ${selected.length} of ${ops.length} operations):`,
+	);
 	for (const [tag, tagOps] of groups) {
 		lines.push(`  ${tag}:`);
 		for (const op of tagOps) {
@@ -338,8 +341,22 @@ export function specToTypeScript(
 
 	const omitted = ops.length - selected.length;
 	if (omitted > 0) {
-		lines.push(`  ... ${omitted} more operations — use searchSpec(query) or searchPaths(query) in your code to discover them`);
+		lines.push(
+			`  ... ${omitted} more operations — use searchSpec(query) or searchPaths(query) in your code to discover them`,
+		);
 	}
-
 	return lines.join("\n");
+}
+
+/**
+ * Generate a compact API summary from a resolved OpenAPI spec.
+ */
+export function specToTypeScript(
+	spec: ResolvedSpec,
+	options?: CatalogSummaryOptions,
+): string {
+	const ops = collectSpecOperations(spec);
+	if (ops.length === 0) return "";
+	const selected = selectSpecOperations(ops, options?.maxEndpoints ?? 20);
+	return renderSpecSummary(spec.info?.title || "API", ops, selected);
 }

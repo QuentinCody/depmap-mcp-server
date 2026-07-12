@@ -37,7 +37,10 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
         extra: { env?: SchemaEnv },
     ) => {
         const runtimeEnv = env || extra?.env || {};
-        return handler(args, runtimeEnv as Record<string, unknown>);
+        // Pass the full extra (not just sessionId) so the handler resolves the same
+        // request scope the execute/staging path registers under (getRequestScope:
+        // _meta["dev.quentincody.bio/chatId"] / mcp-chat-id header, then sessionId).
+        return handler(args, runtimeEnv as Record<string, unknown>, extra as Record<string, unknown>);
     };
 
     const reg = (name: string) =>

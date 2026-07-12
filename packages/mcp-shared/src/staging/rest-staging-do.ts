@@ -11,22 +11,31 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { SchemaValidator } from "@bio-mcp/syntaqlite-worker";
+import { VirtualFS } from "../filesystem/virtual-fs";
 import { ChunkingEngine } from "./chunking";
+import { mergeSchemaHints } from "./schema-hints";
 import {
-	detectArrays,
-	inferSchema,
-	materializeSchema,
 	computeColumnProfiles,
+	detectArrays,
 	type InferredSchema,
 	type InferredTable,
+	inferSchema,
+	materializeSchema,
 	type SchemaHints,
 	type TableProfile,
 } from "./schema-inference";
+import {
+	buildColumnDescriptor,
+	buildColumnMeta,
+	buildProfileByTable,
+	buildRelationshipJoins,
+	normalizeProvenance,
+	type ProvenanceRow,
+} from "./schema-response";
 import { stageData } from "./staging-engine";
-import type { DomainConfig, StagingContext, StagingHints } from "./types";
 import type { TableRelationship } from "./staging-metadata";
-import { VirtualFS } from "../filesystem/virtual-fs";
-import { SchemaValidator } from "@bio-mcp/syntaqlite-worker";
+import type { DomainConfig, StagingContext, StagingHints } from "./types";
 
 // ---------------------------------------------------------------------------
 // Request body interfaces for handleProcess / handleQuery / handleRegister
@@ -67,81 +76,9 @@ interface SessionRegistryRow {
 	created_at: string;
 }
 
-interface ProvenanceRow {
-	tool_name: string | null;
-	server_name: string | null;
-	api_url: string | null;
-	staged_at: string | null;
-	input_rows: number | null;
-	stored_rows: number | null;
-	failed_rows: number | null;
-}
-
-// ---------------------------------------------------------------------------
-// Schema hints merging — client-provided hints override server defaults
-// ---------------------------------------------------------------------------
-
-/**
- * Merge server-side schema hints with client-provided hints.
- * Client hints take precedence for overlapping keys (columnTypes, indexes, etc.).
- * Returns undefined if both inputs are undefined.
- */
-function mergeSchemaHints(
-	serverHints: SchemaHints | undefined,
-	clientHints: SchemaHints | undefined,
-): SchemaHints | undefined {
-	if (!serverHints && !clientHints) return undefined;
-	if (!serverHints) return clientHints;
-	if (!clientHints) return serverHints;
-
-	return {
-		// Client tableName wins if set
-		tableName: clientHints.tableName ?? serverHints.tableName,
-		// Merge columnTypes — client overrides per-column
-		columnTypes: serverHints.columnTypes || clientHints.columnTypes
-			? { ...serverHints.columnTypes, ...clientHints.columnTypes }
-			: undefined,
-		// Merge indexes — deduplicated union
-		indexes: serverHints.indexes || clientHints.indexes
-			? [...new Set([...(serverHints.indexes ?? []), ...(clientHints.indexes ?? [])])]
-			: undefined,
-		// Merge flatten depth overrides — client wins per-key
-		flatten: serverHints.flatten || clientHints.flatten
-			? { ...serverHints.flatten, ...clientHints.flatten }
-			: undefined,
-		// Merge exclude — deduplicated union
-		exclude: serverHints.exclude || clientHints.exclude
-			? [...new Set([...(serverHints.exclude ?? []), ...(clientHints.exclude ?? [])])]
-			: undefined,
-		// Merge skipChildTables — deduplicated union
-		skipChildTables: serverHints.skipChildTables || clientHints.skipChildTables
-			? [...new Set([...(serverHints.skipChildTables ?? []), ...(clientHints.skipChildTables ?? [])])]
-			: undefined,
-		// Client maxRecursionDepth wins if set
-		maxRecursionDepth: clientHints.maxRecursionDepth ?? serverHints.maxRecursionDepth,
-		// Merge compositeIndexes — concatenate (de-dup by serialized form)
-		compositeIndexes: serverHints.compositeIndexes || clientHints.compositeIndexes
-			? deduplicateCompositeIndexes([
-				...(serverHints.compositeIndexes ?? []),
-				...(clientHints.compositeIndexes ?? []),
-			])
-			: undefined,
-	};
-}
-
-/** Deduplicate composite indexes by their serialized column list. */
-function deduplicateCompositeIndexes(indexes: string[][]): string[][] {
-	const seen = new Set<string>();
-	const result: string[][] = [];
-	for (const idx of indexes) {
-		const key = idx.join(",");
-		if (!seen.has(key)) {
-			seen.add(key);
-			result.push(idx);
-		}
-	}
-	return result;
-}
+// Schema-hint merging (`mergeSchemaHints`) lives in ./schema-hints so the pure
+// logic can be unit-tested without loading this module's `cloudflare:workers`
+// import. See schema-hints.test.ts.
 
 /** Strip LIMIT/OFFSET clause from a SQL query for COUNT(*) wrapping. */
 function stripLimit(sql: string): string {
@@ -170,6 +107,10 @@ export class RestStagingDO extends DurableObject {
 		});
 	}
 
+	protected get sql() {
+		return this.ctx.storage.sql;
+	}
+
 	/**
 	 * Lazily create a SchemaValidator using the stored inferred schema.
 	 * Returns null if schema is unavailable or parsing fails.
@@ -179,7 +120,7 @@ export class RestStagingDO extends DurableObject {
 		if (this.schemaValidator) return this.schemaValidator;
 		if (this.schemaValidatorInitFailed) return null;
 		try {
-			const row = this.ctx.storage.sql
+			const row = this.sql
 				.exec("SELECT schema_json FROM _inferred_schema WHERE id = 1")
 				.one() as { schema_json: string } | undefined;
 			if (!row?.schema_json) return null;
@@ -219,20 +160,20 @@ export class RestStagingDO extends DurableObject {
 	 * Future schema changes (ALTER TABLE, new indexes) go as new version blocks.
 	 */
 	private migrateMetadata(): void {
-		this.ctx.storage.sql.exec(
+		this.sql.exec(
 			`CREATE TABLE IF NOT EXISTS _do_migrations (
 				id INTEGER PRIMARY KEY,
 				applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 			)`,
 		);
 
-		const row = this.ctx.storage.sql
+		const row = this.sql
 			.exec("SELECT COALESCE(MAX(id), 0) as v FROM _do_migrations")
 			.one() as { v: number };
 		const version = row.v;
 
 		if (version < 1) {
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`CREATE TABLE IF NOT EXISTS _staging_metadata (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					tool_name TEXT,
@@ -246,19 +187,19 @@ export class RestStagingDO extends DurableObject {
 					warnings_json TEXT
 				)`,
 			);
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`CREATE TABLE IF NOT EXISTS _inferred_schema (
 					id INTEGER PRIMARY KEY,
 					schema_json TEXT
 				)`,
 			);
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`CREATE TABLE IF NOT EXISTS _column_profiles (
 					id INTEGER PRIMARY KEY,
 					profiles_json TEXT
 				)`,
 			);
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`CREATE TABLE IF NOT EXISTS _session_registry (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					session_id TEXT NOT NULL,
@@ -270,13 +211,11 @@ export class RestStagingDO extends DurableObject {
 					created_at TEXT DEFAULT CURRENT_TIMESTAMP
 				)`,
 			);
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`CREATE INDEX IF NOT EXISTS idx_session_registry_session_time
 					ON _session_registry(session_id, created_at)`,
 			);
-			this.ctx.storage.sql.exec(
-				`INSERT INTO _do_migrations (id) VALUES (1)`,
-			);
+			this.sql.exec(`INSERT INTO _do_migrations (id) VALUES (1)`);
 		}
 
 		// Future migrations go here:
@@ -365,7 +304,7 @@ export class RestStagingDO extends DurableObject {
 		apiUrl?: string;
 	}): void {
 		if (context) {
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`INSERT INTO _staging_metadata (tool_name, server_name, args_json, api_url) VALUES (?, ?, ?, ?)`,
 				context.toolName ?? null,
 				context.serverName ?? null,
@@ -385,7 +324,7 @@ export class RestStagingDO extends DurableObject {
 		warnings: unknown[],
 	): void {
 		try {
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`UPDATE _staging_metadata SET input_rows = ?, stored_rows = ?, failed_rows = ?, warnings_json = ? WHERE id = (SELECT MAX(id) FROM _staging_metadata)`,
 				inputRows,
 				storedRows,
@@ -393,7 +332,7 @@ export class RestStagingDO extends DurableObject {
 				warnings.length > 0 ? JSON.stringify(warnings) : null,
 			);
 		} catch {
-			// Don't fail staging if metadata update fails
+			/* best-effort: Don't fail staging if metadata update fails */
 		}
 	}
 
@@ -416,7 +355,7 @@ export class RestStagingDO extends DurableObject {
 			for (const t of schema.tables) byName.set(t.name, t);
 			const merged: InferredSchema = { tables: Array.from(byName.values()) };
 
-			this.ctx.storage.sql.exec(
+			this.sql.exec(
 				`INSERT OR REPLACE INTO _inferred_schema (id, schema_json) VALUES (1, ?)`,
 				JSON.stringify(merged),
 			);
@@ -424,14 +363,14 @@ export class RestStagingDO extends DurableObject {
 			this.schemaValidator = null;
 			this.schemaValidatorInitFailed = false;
 		} catch {
-			// Non-critical — schema still works via PRAGMA, just without enrichment
+			/* best-effort: — schema still works via PRAGMA, just without enrichment */
 		}
 	}
 
 	/** Read the persisted inferred schema, or null if absent / malformed. */
 	private readInferredSchemaUnsafe(): InferredSchema | null {
 		try {
-			const row = this.ctx.storage.sql
+			const row = this.sql
 				.exec("SELECT schema_json FROM _inferred_schema WHERE id = 1")
 				.one() as { schema_json: string } | undefined;
 			if (!row?.schema_json) return null;
@@ -447,13 +386,13 @@ export class RestStagingDO extends DurableObject {
 	 */
 	private persistColumnProfiles(schema: InferredSchema): void {
 		try {
-			const profiles = computeColumnProfiles(schema, this.ctx.storage.sql);
-			this.ctx.storage.sql.exec(
+			const profiles = computeColumnProfiles(schema, this.sql);
+			this.sql.exec(
 				`INSERT OR REPLACE INTO _column_profiles (id, profiles_json) VALUES (1, ?)`,
 				JSON.stringify(profiles),
 			);
 		} catch {
-			// Non-critical — schema still works without profiles
+			/* best-effort: — schema still works without profiles */
 		}
 	}
 
@@ -477,7 +416,9 @@ export class RestStagingDO extends DurableObject {
 
 	private async handleProcess(request: Request): Promise<Response> {
 		const raw: unknown = await request.json();
-		const container: ProcessRequestBody = (raw !== null && typeof raw === "object" ? raw : {}) as ProcessRequestBody;
+		const container: ProcessRequestBody = (
+			raw !== null && typeof raw === "object" ? raw : {}
+		) as ProcessRequestBody;
 		const data = container.data ?? raw;
 
 		// Extract provenance context from request body
@@ -493,13 +434,7 @@ export class RestStagingDO extends DurableObject {
 			const stagingHints = this.getStagingHints(data);
 
 			const result = this.ctx.storage.transactionSync(() =>
-				stageData(
-					data,
-					this.ctx.storage.sql,
-					context,
-					stagingHints,
-					domainConfig,
-				),
+				stageData(data, this.sql, context, stagingHints, domainConfig),
 			);
 
 			return this.jsonResponse({
@@ -518,94 +453,88 @@ export class RestStagingDO extends DurableObject {
 		const arrays = detectArrays(data);
 
 		if (arrays.length > 0 && arrays.some((a) => a.rows.length > 0)) {
-			const schema = inferSchema(arrays, hints);
+			try {
+				const schema = inferSchema(arrays, hints);
+				// Persist inferred schema for enriched handleSchema() output
+				this.persistInferredSchema(schema);
+				const rowsMap = new Map<string, unknown[]>();
+				for (const arr of arrays) {
+					const tableName =
+						hints?.tableName ??
+						arr.key.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
+					const actualName =
+						schema.tables.length === 1
+							? schema.tables[0].name
+							: (schema.tables.find((t) => t.name === tableName)?.name ??
+								tableName);
+					rowsMap.set(actualName, arr.rows);
+				}
 
-			// Persist inferred schema for enriched handleSchema() output
-			this.persistInferredSchema(schema);
-			// Compute and persist column profiles after schema inference
-			// (must come after materializeSchema — we do it below)
+				const result = this.ctx.storage.transactionSync(() =>
+					materializeSchema(schema, rowsMap, this.sql),
+				);
 
-			const rowsMap = new Map<string, unknown[]>();
-			for (const arr of arrays) {
-				const tableName = hints?.tableName ?? arr.key.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
-				const actualName = schema.tables.length === 1
-					? schema.tables[0].name
-					: schema.tables.find((t) => t.name === tableName)?.name ?? tableName;
-				rowsMap.set(actualName, arr.rows);
+				// Track row counts in provenance
+				this.updateProvenanceRowCounts(
+					result.inputRows,
+					result.totalRows,
+					result.failedRows,
+					result.warnings,
+				);
+				// Compute and persist column profiles (runs SQL against populated tables)
+				this.persistColumnProfiles(schema);
+				const relationships = this.extractRelationships(schema);
+				// Build staging warnings if data was lost
+				const stagingWarnings: Record<string, unknown> = {};
+				if (result.failedRows > 0) {
+					stagingWarnings.rows_skipped = result.failedRows;
+					stagingWarnings.sample_errors = result.warnings
+						.slice(0, 5)
+						.map((w) => ({ row: w.rowIndex, table: w.table, error: w.error }));
+				}
+				const lossPercent =
+					result.inputRows > 0
+						? (result.failedRows / result.inputRows) * 100
+						: 0;
+				if (lossPercent > 5) {
+					stagingWarnings.data_loss_warning =
+						`${result.failedRows} of ${result.inputRows} rows (${lossPercent.toFixed(1)}%) failed to stage. ` +
+						`This exceeds the 5% threshold. Review sample_errors for details.`;
+				}
+
+				return this.jsonResponse({
+					success: true,
+					table_count: result.tablesCreated.length,
+					total_rows: result.totalRows,
+					input_rows: result.inputRows,
+					table_row_counts: result.tableRowCounts,
+					tables_created: result.tablesCreated,
+					...(relationships.length > 0 ? { relationships } : {}),
+					...(Object.keys(stagingWarnings).length > 0
+						? { staging_warnings: stagingWarnings }
+						: {}),
+				});
+			} catch (matErr) {
+				console.warn("T5.3 staging fallback: materialization failed", matErr);
 			}
-
-			const result = this.ctx.storage.transactionSync(() =>
-				materializeSchema(
-					schema,
-					rowsMap,
-					this.ctx.storage.sql,
-				),
-			);
-
-			// Track row counts in provenance
-			this.updateProvenanceRowCounts(
-				result.inputRows,
-				result.totalRows,
-				result.failedRows,
-				result.warnings,
-			);
-
-			// Compute and persist column profiles (runs SQL against the just-populated tables)
-			this.persistColumnProfiles(schema);
-
-			// Extract relationships from schema
-			const relationships = this.extractRelationships(schema);
-
-			// Build staging warnings if data was lost
-			const stagingWarnings: Record<string, unknown> = {};
-			if (result.failedRows > 0) {
-				stagingWarnings.rows_skipped = result.failedRows;
-				stagingWarnings.sample_errors = result.warnings.slice(0, 5).map((w) => ({
-					row: w.rowIndex,
-					table: w.table,
-					error: w.error,
-				}));
-			}
-			const lossPercent = result.inputRows > 0
-				? (result.failedRows / result.inputRows) * 100
-				: 0;
-			if (lossPercent > 5) {
-				stagingWarnings.data_loss_warning =
-					`${result.failedRows} of ${result.inputRows} rows (${lossPercent.toFixed(1)}%) failed to stage. ` +
-					`This exceeds the 5% threshold. Review sample_errors for details.`;
-			}
-
-			return this.jsonResponse({
-				success: true,
-				table_count: result.tablesCreated.length,
-				total_rows: result.totalRows,
-				input_rows: result.inputRows,
-				table_row_counts: result.tableRowCounts,
-				tables_created: result.tablesCreated,
-				...(relationships.length > 0 ? { relationships } : {}),
-				...(Object.keys(stagingWarnings).length > 0 ? { staging_warnings: stagingWarnings } : {}),
-			});
 		}
 
 		// Fallback: store entire payload as chunked JSON
-		this.ctx.storage.sql.exec(
+		this.sql.exec(
 			`CREATE TABLE IF NOT EXISTS payloads (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				root_json TEXT,
 				created_at TEXT DEFAULT CURRENT_TIMESTAMP
 			)`,
 		);
-		const jsonStr = await this.chunking.smartJsonStringify(
-			data,
-			this.ctx.storage.sql,
-		);
-		this.ctx.storage.sql.exec(
-			`INSERT INTO payloads (root_json) VALUES (?)`,
-			jsonStr,
-		);
+		const jsonStr = await this.chunking.smartJsonStringify(data, this.sql);
+		this.sql.exec(`INSERT INTO payloads (root_json) VALUES (?)`, jsonStr);
 		const count =
-			(this.ctx.storage.sql.exec(`SELECT COUNT(*) as c FROM payloads`).one() as { c: number })
-				?.c ?? 0;
+			(
+				this.sql.exec(`SELECT COUNT(*) as c FROM payloads`).one() as {
+					c: number;
+				}
+			)?.c ?? 0;
 		return this.jsonResponse({
 			success: true,
 			table_count: 1,
@@ -616,13 +545,15 @@ export class RestStagingDO extends DurableObject {
 
 	private async handleQuery(request: Request): Promise<Response> {
 		const raw: unknown = await request.json();
-		const body: SqlQueryBody = (raw !== null && typeof raw === "object" ? raw : { sql: "" }) as SqlQueryBody;
+		const body: SqlQueryBody = (
+			raw !== null && typeof raw === "object" ? raw : { sql: "" }
+		) as SqlQueryBody;
 
 		// Pre-execution schema validation — catches column/table typos with suggestions
 		const validationError = this.validateSql(body.sql);
 		if (validationError) return validationError;
 
-		const res = this.ctx.storage.sql.exec(body.sql);
+		const res = this.sql.exec(body.sql);
 		const results = res.toArray();
 
 		// If count_total requested, run a COUNT(*) wrapper to determine total matching rows
@@ -632,8 +563,10 @@ export class RestStagingDO extends DurableObject {
 			try {
 				// Wrap the user's query (with LIMIT stripped) in a COUNT(*)
 				const countSql = `SELECT COUNT(*) as c FROM (${stripLimit(body.sql)})`;
-				const countResult = this.ctx.storage.sql.exec(countSql).one();
-				totalMatching = Number((countResult as { c: number })?.c ?? results.length);
+				const countResult = this.sql.exec(countSql).one();
+				totalMatching = Number(
+					(countResult as { c: number })?.c ?? results.length,
+				);
 				truncated = totalMatching > results.length;
 			} catch {
 				// If COUNT wrapper fails (e.g. complex CTEs), just report based on results
@@ -653,13 +586,17 @@ export class RestStagingDO extends DurableObject {
 
 	private async handleQueryEnhanced(request: Request): Promise<Response> {
 		const rawEnhanced: unknown = await request.json();
-		const body: SqlQueryBody = (rawEnhanced !== null && typeof rawEnhanced === "object" ? rawEnhanced : { sql: "" }) as SqlQueryBody;
+		const body: SqlQueryBody = (
+			rawEnhanced !== null && typeof rawEnhanced === "object"
+				? rawEnhanced
+				: { sql: "" }
+		) as SqlQueryBody;
 
 		// Pre-execution schema validation — catches column/table typos with suggestions
 		const validationError = this.validateSql(body.sql);
 		if (validationError) return validationError;
 
-		const res = this.ctx.storage.sql.exec(body.sql);
+		const res = this.sql.exec(body.sql);
 		const rows = res.toArray();
 		const enhanced: Record<string, unknown>[] = [];
 		for (const row of rows) {
@@ -669,7 +606,7 @@ export class RestStagingDO extends DurableObject {
 					const id = this.chunking.extractContentId(v);
 					const content = await this.chunking.retrieveChunkedContent(
 						id,
-						this.ctx.storage.sql,
+						this.sql,
 					);
 					try {
 						out[k] = content ? JSON.parse(content) : null;
@@ -689,8 +626,10 @@ export class RestStagingDO extends DurableObject {
 		if (body.count_total) {
 			try {
 				const countSql = `SELECT COUNT(*) as c FROM (${stripLimit(body.sql)})`;
-				const countResult = this.ctx.storage.sql.exec(countSql).one();
-				totalMatching = Number((countResult as { c: number })?.c ?? enhanced.length);
+				const countResult = this.sql.exec(countSql).one();
+				totalMatching = Number(
+					(countResult as { c: number })?.c ?? enhanced.length,
+				);
 				truncated = totalMatching > enhanced.length;
 			} catch {
 				truncated = undefined;
@@ -727,11 +666,13 @@ export class RestStagingDO extends DurableObject {
 		// Load persisted inferred schema for enrichment
 		let inferredSchema: InferredSchema | undefined;
 		try {
-			const schemaResults = this.ctx.storage.sql
-				.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name = '_inferred_schema'`)
+			const schemaResults = this.sql
+				.exec(
+					`SELECT name FROM sqlite_master WHERE type='table' AND name = '_inferred_schema'`,
+				)
 				.toArray();
 			if (schemaResults.length > 0) {
-				const schemaRow = this.ctx.storage.sql
+				const schemaRow = this.sql
 					.exec(`SELECT schema_json FROM _inferred_schema WHERE id = 1`)
 					.one() as { schema_json: string } | undefined;
 				if (schemaRow?.schema_json) {
@@ -739,52 +680,38 @@ export class RestStagingDO extends DurableObject {
 				}
 			}
 		} catch {
-			// Non-critical — fall back to PRAGMA-only output
+			/* best-effort: — fall back to PRAGMA-only output */
 		}
 
 		// Build column metadata lookup from inferred schema
-		const columnMeta = new Map<string, { jsonShape?: string; pipeDelimited?: boolean }>();
-		if (inferredSchema) {
-			for (const table of inferredSchema.tables) {
-				for (const col of table.columns) {
-					const key = `${table.name}.${col.name}`;
-					if (col.jsonShape || col.pipeDelimited) {
-						columnMeta.set(key, {
-							jsonShape: col.jsonShape,
-							pipeDelimited: col.pipeDelimited,
-						});
-					}
-				}
-			}
-		}
+		const columnMeta = buildColumnMeta(inferredSchema);
 
 		// Load persisted column profiles
 		let columnProfiles: TableProfile[] | undefined;
 		try {
-			const profileResults = this.ctx.storage.sql
-				.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name = '_column_profiles'`)
+			const profileResults = this.sql
+				.exec(
+					`SELECT name FROM sqlite_master WHERE type='table' AND name = '_column_profiles'`,
+				)
 				.toArray();
 			if (profileResults.length > 0) {
-				const profileRow = this.ctx.storage.sql
+				const profileRow = this.sql
 					.exec(`SELECT profiles_json FROM _column_profiles WHERE id = 1`)
 					.one() as { profiles_json: string } | undefined;
 				if (profileRow?.profiles_json) {
-					columnProfiles = JSON.parse(profileRow.profiles_json) as TableProfile[];
+					columnProfiles = JSON.parse(
+						profileRow.profiles_json,
+					) as TableProfile[];
 				}
 			}
 		} catch {
-			// Non-critical
+			/* best-effort: non-critical fallback */
 		}
 
 		// Build profile lookup: tableName → { colName → ColumnProfile }
-		const profileByTable = new Map<string, Record<string, unknown>>();
-		if (columnProfiles) {
-			for (const tp of columnProfiles) {
-				profileByTable.set(tp.table, tp.columns as unknown as Record<string, unknown>);
-			}
-		}
+		const profileByTable = buildProfileByTable(columnProfiles);
 
-		const tableResults = this.ctx.storage.sql
+		const tableResults = this.sql
 			.exec(
 				`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_staging_%' AND name NOT IN ('_inferred_schema', '_column_profiles')`,
 			)
@@ -792,10 +719,10 @@ export class RestStagingDO extends DurableObject {
 
 		for (const table of tableResults) {
 			const tableName = table.name as string;
-			const columnResults = this.ctx.storage.sql
+			const columnResults = this.sql
 				.exec(`PRAGMA table_info(${tableName})`)
 				.toArray();
-			const countResult = this.ctx.storage.sql
+			const countResult = this.sql
 				.exec(`SELECT COUNT(*) as count FROM "${tableName}"`)
 				.one();
 			const rowCount = Number((countResult as { count: number })?.count || 0);
@@ -803,66 +730,39 @@ export class RestStagingDO extends DurableObject {
 
 			tables[tableName] = {
 				row_count: rowCount,
-				columns: columnResults.map((col: Record<string, unknown>) => {
-					const colName = col.name as string;
-					const meta = columnMeta.get(`${tableName}.${colName}`);
-					const tableProfiles = profileByTable.get(tableName) as Record<string, Record<string, unknown>> | undefined;
-					const colProfile = tableProfiles?.[colName];
-					return {
-						name: colName,
-						type: col.type as string,
-						not_null: col.notnull === 1,
-						primary_key: col.pk === 1,
-						...(meta?.jsonShape ? { json_shape: meta.jsonShape } : {}),
-						...(meta?.pipeDelimited ? { searchable_array: true } : {}),
-						...(colProfile ? { profile: colProfile } : {}),
-					};
-				}),
+				columns: columnResults.map((col: Record<string, unknown>) =>
+					buildColumnDescriptor(col, tableName, columnMeta, profileByTable),
+				),
 			};
 		}
 
-		// Extract relationships from inferred schema
+		// Extract relationships from inferred schema and attach sample JOIN SQL
 		const relationships: TableRelationship[] = inferredSchema
 			? this.extractRelationships(inferredSchema)
 			: [];
-
-		// Generate sample JOIN SQL for each relationship
-		const relationshipsWithJoins = relationships.map((rel) => {
-			// Determine parent PK column: if parent has a data "id" column, PK is _rowid
-			const parentTable = inferredSchema?.tables.find((t) => t.name === rel.parent_table);
-			const parentHasDataId = parentTable?.columns.some((c) => c.name === "id") ?? false;
-			const parentKeyCol = parentHasDataId ? "_rowid" : "id";
-			return {
-				...rel,
-				join_sql: `SELECT p.*, c.* FROM "${rel.parent_table}" p JOIN "${rel.child_table}" c ON c.parent_id = p.${parentKeyCol}`,
-			};
-		});
+		const relationshipsWithJoins = buildRelationshipJoins(
+			relationships,
+			inferredSchema,
+		);
 
 		// Include provenance metadata if available
 		let provenance: ProvenanceRow | undefined;
 		try {
-			const metaResults = this.ctx.storage.sql
-				.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name = '_staging_metadata'`)
+			const metaResults = this.sql
+				.exec(
+					`SELECT name FROM sqlite_master WHERE type='table' AND name = '_staging_metadata'`,
+				)
 				.toArray();
 			if (metaResults.length > 0) {
-				const metaRow = this.ctx.storage.sql
-					.exec(`SELECT tool_name, server_name, api_url, staged_at, input_rows, stored_rows, failed_rows FROM _staging_metadata ORDER BY id DESC LIMIT 1`)
+				const metaRow = this.sql
+					.exec(
+						`SELECT tool_name, server_name, api_url, staged_at, input_rows, stored_rows, failed_rows FROM _staging_metadata ORDER BY id DESC LIMIT 1`,
+					)
 					.toArray();
-				const first = metaRow[0];
-				if (first !== undefined) {
-					provenance = {
-						tool_name: typeof first.tool_name === "string" ? first.tool_name : null,
-						server_name: typeof first.server_name === "string" ? first.server_name : null,
-						api_url: typeof first.api_url === "string" ? first.api_url : null,
-						staged_at: typeof first.staged_at === "string" ? first.staged_at : null,
-						input_rows: typeof first.input_rows === "number" ? first.input_rows : null,
-						stored_rows: typeof first.stored_rows === "number" ? first.stored_rows : null,
-						failed_rows: typeof first.failed_rows === "number" ? first.failed_rows : null,
-					};
-				}
+				provenance = normalizeProvenance(metaRow[0]);
 			}
 		} catch {
-			// Ignore — provenance is optional
+			/* best-effort: Ignore — provenance is optional */
 		}
 
 		return this.jsonResponse({
@@ -871,7 +771,9 @@ export class RestStagingDO extends DurableObject {
 				table_count: Object.keys(tables).length,
 				total_rows: totalRows,
 				tables,
-				...(relationshipsWithJoins.length > 0 ? { relationships: relationshipsWithJoins } : {}),
+				...(relationshipsWithJoins.length > 0
+					? { relationships: relationshipsWithJoins }
+					: {}),
 				metadata: {
 					timestamp: new Date().toISOString(),
 					...(provenance ? { provenance } : {}),
@@ -886,7 +788,9 @@ export class RestStagingDO extends DurableObject {
 	 */
 	private async handleRegister(request: Request): Promise<Response> {
 		const rawRegister: unknown = await request.json();
-		const body: RegisterRequestBody = (rawRegister !== null && typeof rawRegister === "object" ? rawRegister : {}) as RegisterRequestBody;
+		const body: RegisterRequestBody = (
+			rawRegister !== null && typeof rawRegister === "object" ? rawRegister : {}
+		) as RegisterRequestBody;
 
 		if (!body.session_id || !body.data_access_id) {
 			return this.jsonResponse(
@@ -896,11 +800,11 @@ export class RestStagingDO extends DurableObject {
 		}
 
 		// TTL cleanup: remove entries older than 24h
-		this.ctx.storage.sql.exec(
+		this.sql.exec(
 			`DELETE FROM _session_registry WHERE created_at < datetime('now', '-24 hours')`,
 		);
 
-		this.ctx.storage.sql.exec(
+		this.sql.exec(
 			`INSERT INTO _session_registry (session_id, data_access_id, tool_name, tables_json, total_rows, tool_prefix) VALUES (?, ?, ?, ?, ?, ?)`,
 			body.session_id,
 			body.data_access_id,
@@ -919,15 +823,17 @@ export class RestStagingDO extends DurableObject {
 	 */
 	private async handleList(sessionId?: string): Promise<Response> {
 		// Check if the registry table exists
-		const tableExists = this.ctx.storage.sql
-			.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name='_session_registry'`)
+		const tableExists = this.sql
+			.exec(
+				`SELECT name FROM sqlite_master WHERE type='table' AND name='_session_registry'`,
+			)
 			.toArray();
 		if (tableExists.length === 0) {
 			return this.jsonResponse({ success: true, datasets: [] });
 		}
 
 		// TTL cleanup
-		this.ctx.storage.sql.exec(
+		this.sql.exec(
 			`DELETE FROM _session_registry WHERE created_at < datetime('now', '-24 hours')`,
 		);
 
@@ -935,7 +841,7 @@ export class RestStagingDO extends DurableObject {
 			return this.jsonResponse({ success: true, datasets: [] });
 		}
 
-		const rows = this.ctx.storage.sql
+		const rows = this.sql
 			.exec(
 				`SELECT data_access_id, tool_name, tables_json, total_rows, tool_prefix, created_at FROM _session_registry WHERE session_id = ? ORDER BY created_at DESC`,
 				sessionId,
@@ -944,9 +850,10 @@ export class RestStagingDO extends DurableObject {
 
 		const datasets = rows.map((row) => {
 			const r = row as unknown as SessionRegistryRow;
-			const parsedTables = typeof r.tables_json === "string"
-				? (safeJsonParse(r.tables_json) ?? [])
-				: [];
+			const parsedTables =
+				typeof r.tables_json === "string"
+					? (safeJsonParse(r.tables_json) ?? [])
+					: [];
 			return {
 				data_access_id: r.data_access_id,
 				tool_name: r.tool_name,
@@ -967,7 +874,7 @@ export class RestStagingDO extends DurableObject {
 	private _vfs: VirtualFS | undefined;
 	private get vfs(): VirtualFS {
 		if (!this._vfs) {
-			this._vfs = new VirtualFS(this.ctx.storage.sql);
+			this._vfs = new VirtualFS(this.sql);
 		}
 		return this._vfs;
 	}
