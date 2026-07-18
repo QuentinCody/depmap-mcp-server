@@ -231,7 +231,9 @@ export {
 } from "./tools/direct-query";
 export {
 	createGraphqlProxyTool,
+	type GraphqlErrorInfo,
 	type GraphqlProxyToolOptions,
+	inspectGraphqlErrors,
 } from "./tools/graphql-proxy";
 // Tool definitions
 export { sqlTools } from "./tools/sql";
