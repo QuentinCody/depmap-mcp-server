@@ -1,3 +1,4 @@
+import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
 /**
  * DepMap MCP server entrypoint.
  *
@@ -204,6 +205,8 @@ export class MyMCP extends McpAgent {
     });
 
     async init() {
+
+    	configureCitationSigning(this.env);
         const env = resolveEnv(this.env);
         registerQueryData(this.server, env);
         registerGetSchema(this.server, env);
@@ -327,10 +330,7 @@ export default {
         const url = new URL(request.url);
 
         if (url.pathname === "/health") {
-            return new Response("ok", {
-                status: 200,
-                headers: { "content-type": "text/plain" },
-            });
+            return buildHealthResponse("depmap");
         }
 
         if (url.pathname === "/mcp") {
