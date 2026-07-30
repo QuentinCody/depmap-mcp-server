@@ -10,7 +10,7 @@
  * label (e.g. "24Q4") that callers can pin queries to. The actual table
  * routing is encoded in the SQL via the table name (e.g. "gene_effect_24Q4").
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import { createQueryDataHandler } from "@bio-mcp/shared/staging/utils";
 

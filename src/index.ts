@@ -3,7 +3,7 @@ import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
  * DepMap MCP server entrypoint.
  *
  * Wires together:
- *   - The McpAgent + 7 tools (search, execute, query_data, get_schema,
+ *   - The stateless MCP handler + 7 tools (search, execute, query_data, get_schema,
  *     release_status, load_release)
  *   - The fetch handler exposing /health and /mcp
  *   - The scheduled handler that runs daily and ingests new Figshare
@@ -17,8 +17,8 @@ import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
  * — there is no per-session DO routing for staged data.
  */
 
-import { McpAgent } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StatelessMcpWorker } from "@bio-mcp/shared/mcp";
+import { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 
 import { DepMapDataDO } from "./do";
@@ -198,7 +198,7 @@ function resolveEnv(env: unknown): DepMapEnv {
     return env as DepMapEnv;
 }
 
-export class MyMCP extends McpAgent {
+export class MyMCP extends StatelessMcpWorker {
     server = new McpServer({
         name: "depmap",
         version: "0.1.0",
@@ -334,7 +334,7 @@ export default {
         }
 
         if (url.pathname === "/mcp") {
-            return MyMCP.serve("/mcp", { binding: "MCP_OBJECT" }).fetch(
+            return MyMCP.serve("/mcp").fetch(
                 request,
                 env,
                 ctx,

@@ -6,7 +6,7 @@
  *   depmap_execute : V8 isolate with api.get / api.post calling the
  *                    DepMap portal REST surface
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@bio-mcp/shared/mcp";
 import { createSearchTool } from "@bio-mcp/shared/codemode/search-tool";
 import { createExecuteTool } from "@bio-mcp/shared/codemode/execute-tool";
 import { depmapCatalog } from "../spec/catalog";

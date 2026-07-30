@@ -38,6 +38,19 @@ function assertContains(filePath, haystack, needle, testName) {
     }
 }
 
+function assertNotContains(filePath, haystack, needle, testName) {
+    totalTests++;
+    if (!haystack.includes(needle)) {
+        console.log(`${GREEN}✓${RESET} ${testName}`);
+        passedTests++;
+    } else {
+        console.log(`${RED}✗${RESET} ${testName}`);
+        console.log(`  Unexpected: ${needle}`);
+        console.log(`  File: ${filePath}`);
+        failedTests++;
+    }
+}
+
 function readFile(relPath) {
     const absPath = path.resolve(SERVER_ROOT, relPath);
     return fs.readFileSync(absPath, "utf8");
@@ -104,7 +117,8 @@ for (const t of stagingToolFiles) {
     const f = "wrangler.jsonc";
     const c = readFile(f);
     assertContains(f, c, '"DEPMAP_DATA_DO"', `${f}: declares DEPMAP_DATA_DO binding`);
-    assertContains(f, c, '"MCP_OBJECT"', `${f}: declares MCP_OBJECT binding`);
+    assertNotContains(f, c, '"MCP_OBJECT"', `${f}: has no retired transport DO binding`);
+    assertContains(f, c, '"mcp-2026-07-28-stateless"', `${f}: deletes the retired transport class`);
     assertContains(f, c, '"crons"', `${f}: declares cron trigger`);
     assertContains(f, c, "0 11 * * *", `${f}: cron runs daily at 11:00 UTC`);
     assertContains(f, c, '"port": 8816', `${f}: dev port matches manifest`);
