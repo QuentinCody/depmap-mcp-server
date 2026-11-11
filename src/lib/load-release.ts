@@ -13,8 +13,8 @@
  *                    version, dataset} and staged into a per-dataset,
  *                    per-version table named "<dataset>_<version>".
  *   - "dimension"  — tabular CSV (one row per cell line). Passed through
- *                    as-is and staged into the table name listed by the
- *                    dataset entry.
+ *                    with a release marker and staged into the dataset's
+ *                    dimension table name plus its explicit version suffix.
  */
 
 import { csvStream } from "@bio-mcp/shared/staging/csv-stream";
@@ -96,7 +96,7 @@ export interface StageBatchResult {
 /**
  * Stage one batch of rows into the singleton DO. The orchestrator passes
  * an optional schema-hints hint so the staging engine targets the right
- * table name (per-dataset for matrix, fixed for dimension).
+ * table name (release-qualified for both matrices and dimensions).
  */
 export type StageBatchFn = (
     rows: readonly Record<string, unknown>[],
@@ -162,6 +162,9 @@ async function processMatrix(
             const keys = Object.keys(row);
             geneColumn = keys[0] ?? "gene";
             cellLineColumns = keys.slice(1);
+            if (!cellLineColumns.length || cellLineColumns.some(key => !/^ACH-\d+$/.test(key))) {
+                throw new Error("Legacy loader requires genes in rows and ACH model IDs in columns; inspect the selected file schema and use pinned subset harmonization for other orientations");
+            }
         }
         wideRows.push(row);
     }
@@ -197,6 +200,7 @@ async function processMatrix(
 async function processDimension(
     file: FigshareFile,
     spec: DatasetSpec,
+    input: LoadReleaseInput,
     deps: LoadReleaseDeps,
     batchSize: number,
 ): Promise<number> {
@@ -220,10 +224,10 @@ async function processDimension(
         offset += c.length;
     }
     const text = new TextDecoder("utf-8").decode(merged);
-    const rows = parseCsv(text);
+    const rows = parseCsv(text, { autoCastNumbers: false }).map(row => ({ ...row, _depmap_release: input.version }));
 
     let staged = 0;
-    const tableName = spec.dimensionTableName ?? spec.name;
+    const tableName = `${spec.dimensionTableName ?? spec.name}_${input.version}`;
     for (let i = 0; i < rows.length; i += batchSize) {
         const batch = rows.slice(i, i + batchSize);
         const result = await deps.stageBatch(batch, { tableName });
@@ -243,6 +247,8 @@ export async function loadRelease(
     const requestedNames =
         options.datasets ?? RELEASE_DATASETS.map((d) => d.name);
     const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(input.version)) throw new Error("Release version must be a safe, explicit table suffix (letters, digits, underscores)");
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 5000) throw new Error("batchSize must be an integer from 1 to 5000");
 
     const requested: DatasetSpec[] = [];
     for (const name of requestedNames) {
@@ -276,7 +282,7 @@ export async function loadRelease(
             const rows =
                 spec.kind === "matrix"
                     ? await processMatrix(file, spec, input, deps, batchSize)
-                    : await processDimension(file, spec, deps, batchSize);
+                    : await processDimension(file, spec, input, deps, batchSize);
             datasetResults.push({ name: spec.name, rowsStaged: rows });
             totalRowsStaged += rows;
         } catch (err) {

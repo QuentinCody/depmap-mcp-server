@@ -81,13 +81,18 @@ for (const t of stagingToolFiles) {
     assertContains(f, c, "createDepMapApiFetch", `${f}: passes the depmap api adapter`);
 }
 
-// Admin-gated load-release tool wraps loadRelease and enforces auth.
+// The active importer requires the request Bearer header before discovery/storage.
 {
-    const f = "src/tools/load-release.ts";
+    const f = "src/lib/bulk-runtime.ts";
     const c = readFile(f);
     assertContains(f, c, "DEPMAP_ADMIN_TOKEN", `${f}: references admin token slot`);
     assertContains(f, c, "AUTH_ERROR", `${f}: returns AUTH_ERROR on bad bearer`);
-    assertContains(f, c, "CONFIG_ERROR", `${f}: returns CONFIG_ERROR when token unset`);
+    assertContains(f, c, "!env.DEPMAP_ADMIN_TOKEN", `${f}: rejects an unset token`);
+    assertContains(f, c, "createBulkManifest(args.selection)", `${f}: binds explicitly selected inventory entries`);
+    assertContains(f, c, '"/bulk/seal"', `${f}: verifies all files before publishing`);
+    const tool = readFile("src/tools/bulk.ts");
+    assertContains(f, tool, '["depmap_load_release", "mcp_depmap_load_release"]', "bulk import: dual aliases");
+    assertContains(f, tool, '["depmap_release_status", "mcp_depmap_release_status"]', "bulk status: dual aliases");
 }
 
 // Catalog: every endpoint declared, no auth (public REST), long-form notes.
@@ -101,14 +106,15 @@ for (const t of stagingToolFiles) {
     assertContains(f, c, "/gene_dependency/by_gene", `${f}: covers gene dependency endpoint`);
 }
 
-// Singleton DO routing wired in index.ts.
+// The entrypoint wires resumable imports; cron only observes public inventory.
 {
     const f = "src/index.ts";
     const c = readFile(f);
-    assertContains(f, c, '"release:adult:current"', `${f}: well-known adult DO id`);
-    assertContains(f, c, '"release:pediatric:current"', `${f}: well-known pediatric DO id`);
+    assertContains(f, c, "registerBulkTools(this.server", `${f}: wires verified imports`);
+    assertContains(f, c, 'requestInfo?.headers.get("authorization")', `${f}: uses the request admin header`);
     assertContains(f, c, "scheduled(", `${f}: exports scheduled cron handler`);
-    assertContains(f, c, "checkAndIngestLatest", `${f}: cron delegates to scheduled lib`);
+    assertContains(f, c, "imported: false", `${f}: cron observes without publishing`);
+    assertNotContains(f, c, "checkAndIngestLatest", `${f}: no guessed-file scheduled ingestion`);
     assertContains(f, c, "DepMapDataDO", `${f}: exports DO class for wrangler binding`);
 }
 

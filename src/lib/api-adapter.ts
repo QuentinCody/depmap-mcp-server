@@ -9,6 +9,9 @@
 
 import type { ApiFetchFn } from "@bio-mcp/shared/codemode/catalog";
 import { depmapCatalog } from "../spec/catalog";
+import { commercialRouteRefusal } from "./commercial-profile";
+import { discoverReleases, discoverySelectors, METADATA_PATH } from "./release-discovery";
+import { readDepMapResponse } from "./response";
 
 export interface CreateDepMapApiFetchOptions {
     /** Optional fetch implementation; defaults to global fetch. */
@@ -44,28 +47,38 @@ export function createDepMapApiFetch(
     const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
 
     return async (request) => {
+        // A reselling caller gets no portal data: no route is confirmed for
+        // commercial use (see ./commercial-profile). No upstream request.
+        if (request.licenseProfile === "commercial") {
+            const refusal = commercialRouteRefusal(request.path);
+            if (refusal) return refusal;
+        }
         if (request.method !== "GET") {
             throw new Error(
                 `DepMap REST is read-only (GET only); ${request.method} not supported`,
             );
         }
 
-        const url = buildUrl(baseUrl, request.path, request.params);
+        const metadata = request.path === METADATA_PATH;
+        if (metadata) discoverySelectors(request.params);
+        const url = buildUrl(baseUrl, request.path, metadata ? undefined : request.params);
         const response = await fetchImpl(url, {
             method: "GET",
             headers: {
-                accept: "application/json",
+                accept: metadata ? "text/csv" : "application/json",
                 "user-agent": userAgent,
             },
+            signal: AbortSignal.timeout(30_000),
+            redirect: "manual",
         });
 
         const contentType = response.headers.get("content-type") ?? "";
         const isJson = contentType.includes("json");
+        const text = await readDepMapResponse(response);
 
         if (!response.ok) {
-            const body = isJson
-                ? await response.json().catch(() => null)
-                : await response.text().catch(() => response.statusText);
+            let body: unknown = text;
+            if (isJson) { try { body = JSON.parse(text); } catch { /* Keep upstream text. */ } }
             const message = `HTTP ${response.status}: ${
                 typeof body === "string" ? body.slice(0, 200) : JSON.stringify(body).slice(0, 200)
             }`;
@@ -78,9 +91,10 @@ export function createDepMapApiFetch(
             throw error;
         }
 
-        if (isJson) {
-            return { status: response.status, data: await response.json() };
+        if (metadata) {
+            if (!contentType.toLowerCase().includes("text/csv")) throw new Error("DepMap inventory did not return CSV; possible access challenge or upstream format change");
+            return { status: response.status, data: await discoverReleases(text, request.params) };
         }
-        return { status: response.status, data: await response.text() };
+        return { status: response.status, data: isJson ? JSON.parse(text) : text };
     };
 }

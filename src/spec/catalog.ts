@@ -3,42 +3,42 @@
  *
  * Source of truth: https://github.com/broadinstitute/depmap-api/blob/master/depmap.yml
  *
- * Note: the DepMap REST API is the *small* surface of the project — per
- * gene/cell-line lookups against the latest release. The bulk Figshare
- * matrices are NOT exposed here; they're ingested into the singleton
- * Durable Object via {@link depmap_load_release} (cron-driven) and
- * queried via {@link depmap_query_data}.
+ * Legacy lookup descriptions originate in the 2019Q2 specification, which
+ * names a different host. Their current portal availability is unverified.
+ * Public release metadata is a separate, provider-announced 2026 surface.
  */
 
 import type { ApiCatalog } from "@bio-mcp/shared/codemode/catalog";
+import { releaseEndpoints } from "./releases";
 
 export const depmapCatalog: ApiCatalog = {
     name: "DepMap (Cancer Dependency Map) REST",
     baseUrl: "https://depmap.org/portal/api",
-    version: "1.0",
+    version: "2026-09-28",
     auth: "none",
-    endpointCount: 15,
+    endpointCount: 15 + releaseEndpoints.length,
     notes:
-        "- Per-gene / per-cell-line lookups against the LATEST adult DepMap release.\n" +
-        "- For cohort comparisons or panel-wide analytics across versions, use the bulk-staged data:\n" +
-        "  Figshare release CSVs are ingested into a singleton Durable Object as long-form\n" +
-        "  rows ({entrez_id, gene_symbol, cell_line_id, value, version, dataset}). Query with\n" +
-        "  depmap_query_data using SQL like:\n" +
-        "    SELECT lineage, AVG(value) FROM gene_effect_24Q4\n" +
-        "      JOIN sample_info USING (depmap_id) WHERE entrez_id = 7157 GROUP BY lineage\n" +
+        "- Start with /no-captcha/download/files for current public release/file metadata. No latest-quarter assumption.\n" +
+        "- Legacy per-gene/per-cell-line routes below come from a 2019Q2 API specification naming indigo.ncats.io/depmap. Current portal routing/data freshness are unverified; retained for compatibility.\n" +
+        "- depmap_load_release imports explicitly selected, separately obtained CSV files with inventory/MD5 pins.\n" +
+        "  Resumable admin uploads preserve original bytes and string cells. Every file must verify before atomic publication.\n" +
+        "  depmap_files retains ordered columns_json and source pins; depmap_rows retains cells_json and optional literal index_value.\n" +
+        "  No automatic long-form pivot, identifier resolution, default selection or latest-release inference.\n" +
+        "  Inspect native headers and file roles before SQL joins; mappings/CRISPR/omics share an exact release.\n" +
+        "  Legacy Figshare automatic ingestion is retired from the Worker entrypoint. File access and terms must be established separately.\n" +
         "- The REST API uses two different gene identifier conventions: gene_expression keys\n" +
         "  off Ensembl gene IDs (ENSG...), while gene_dependency / copy_number / rnai /\n" +
         "  mutations key off Entrez gene IDs (integer). Resolve symbols up front via\n" +
         "  biothings_gene_resolve.\n" +
-        "- Cell line IDs are DepMap IDs (ACH-NNNNNN format). Use /cell_lines to enumerate.\n" +
+        "- Model.csv describes ModelID (ACH-). ModelCondition.csv retains condition identity.\n" +
+        "  ScreenSequenceMap.csv maps ScreenID; OmicsProfiles.csv maps SequencingID. Discover actual filenames and columns.\n" +
+        "- depmap_harmonize joins supplied, explicitly pinned CRISPR/omics/PRISM subsets by these IDs; no names, implicit defaults or aggregation.\n" +
         "- Rate limit is undocumented; be conservative (≤2 req/sec) when iterating.\n" +
         "\n" +
         "PEDIATRIC COHORT (PedDep):\n" +
-        "  PedDep is bulk-only — no REST endpoints. Use depmap_query_data with the\n" +
-        "  '_peddep' table suffix (e.g. gene_effect_peddep) instead of the quarterly\n" +
-        "  release tables. PedDep ships from Dharia et al. 2021 (82 lines × 13 tumor\n" +
-        "  types) and grows over time as the PedDep Accelerator releases new data.",
+        "  Select a specific available pediatric release/file. Consult depmap_get_schema for actual staged table names; no fixed suffix or automatic current release is guaranteed.",
     endpoints: [
+        ...releaseEndpoints,
         // === Metadata ===
         {
             method: "GET",

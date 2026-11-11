@@ -1,18 +1,17 @@
 /**
- * `depmap_query_data` — execute SQL against the singleton DO's staged
- * tables (long-form measurement matrices + sample_info dimension).
+ * `depmap_query_data` — execute SQL against staged responses or sealed CSV snapshots.
  *
  * Thin wrapper over the shared {@link createQueryDataHandler}.
  *
- * Note: depmap routes EVERY query against the singleton DO, regardless
- * of `data_access_id`. The `data_access_id` argument here is preserved
- * for shared-handler compatibility but in practice will be the version
- * label (e.g. "24Q4") that callers can pin queries to. The actual table
- * routing is encoded in the SQL via the table name (e.g. "gene_effect_24Q4").
+ * Cohort aliases resolve to verified publications; ordinary staged handles
+ * retain their own Durable Object routing.
  */
 import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import { createQueryDataHandler } from "@bio-mcp/shared/staging/utils";
+import { resolveBulkArgs } from "../lib/bulk-runtime";
+import { commercialHandleError } from "../lib/commercial-profile";
+import { depmapResponse } from "../lib/tool-result";
 
 interface QueryEnv {
     DEPMAP_DATA_DO?: unknown;
@@ -24,17 +23,17 @@ export function registerQueryData(server: McpServer, env?: QueryEnv): void {
     const schema = {
         title: "Query Staged DepMap Data",
         description:
-            "Query staged DepMap (Cancer Dependency Map) bulk data via SQL against the singleton Durable Object. " +
-            "Long-form tables: <dataset>_<version> (e.g. gene_effect_24Q4) with columns " +
-            "{entrez_id, gene_symbol, cell_line_id, value, version, dataset}. " +
-            "Dimension table: sample_info with {depmap_id, lineage, primary_disease, ...}. " +
-            "Use depmap_get_schema to discover available tables and the current release version.",
+            "Query staged responses or verified selected-file snapshots via read-only SQL. " +
+            "Bulk snapshots expose depmap_files (ordered columns_json, pins and checksums), depmap_rows " +
+            "(file_index, one-based record_index, optional literal index_value, string cells_json) and depmap_chunks (original base64 bytes). " +
+            "No implicit pivot, numeric coercion or biological identity resolution. Inspect depmap_get_schema first; " +
+            "adult:current and pediatric:current resolve only completely verified publications.",
         inputSchema: {
             data_access_id: z
                 .string()
                 .min(1)
                 .describe(
-                    "Cohort tag — 'adult:current' or 'pediatric:current'. Routes the query to the matching singleton DO instance.",
+                    "Returned staging/snapshot handle, verified 'adult:current' / 'pediatric:current', or explicit legacy 'release:adult:current' handle.",
                 ),
             sql: z
                 .string()
@@ -45,7 +44,6 @@ export function registerQueryData(server: McpServer, env?: QueryEnv): void {
                 .int()
                 .positive()
                 .max(10000)
-                .default(100)
                 .optional()
                 .describe("Maximum number of rows to return (default: 100)"),
         },
@@ -56,7 +54,10 @@ export function registerQueryData(server: McpServer, env?: QueryEnv): void {
         extra: { env?: QueryEnv },
     ) => {
         const runtimeEnv = env || extra?.env || {};
-        return handler(args, runtimeEnv as Record<string, unknown>);
+        // A reselling caller cannot read imported release files (see lib/commercial-profile).
+        // The check runs before the alias lookup, so it opens no store.
+        return depmapResponse(async () => commercialHandleError(args.data_access_id, extra)
+            ?? handler(await resolveBulkArgs(args, runtimeEnv), runtimeEnv as Record<string, unknown>), runtimeEnv, "depmap_query_data", extra, args);
     };
 
     const reg = (name: string) =>
