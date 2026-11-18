@@ -112,7 +112,7 @@ it("keeps large SQL results intact through complete-envelope staging", async () 
     for (const prefix of ["", "mcp_"]) {
       const result = await f.rpc(prefix + "depmap_query_data", { data_access_id: "adult:current", sql: "SELECT replace(hex(zeroblob(40000)), '00', 'x') AS value" });
       expect(result.structuredContent._staging).toBeDefined();
-      expect((await recover(f, result.structuredContent.data_access_id, prefix)).structuredContent.data.rows[0].value).toBe("x".repeat(40000));
+      expect((await recover(f, result.structuredContent.data_access_id, prefix, f.rpc)).structuredContent.data.rows[0].value).toBe("x".repeat(40000));
     }
   } finally { f.close(); }
 }, 30000);
